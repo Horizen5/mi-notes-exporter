@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "小米笔记导出工具",
+  "version": "1.9.4",
+  "description": "批量导出小米云服务笔记，支持文件夹选择、图片下载和暂停功能",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "storage",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://i.mi.com/*",
+    "https://*.mi.com/*"
+  ],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "点击打开侧边栏"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://i.mi.com/*"],
+      "js": ["content.js"]
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
