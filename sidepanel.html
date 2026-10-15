@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>小米笔记导出 - 侧边栏</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <div class="sidepanel-container">
+    <header class="sp-header">
+      <div class="sp-logo">
+        <span class="logo-icon">📝</span>
+        <h1>小米笔记导出</h1>
+      </div>
+      <div class="sp-status">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-text">检查连接...</span>
+      </div>
+    </header>
+
+    <div class="sp-tabs">
+      <button class="tab-btn active" data-tab="folders">任务</button>
+      <button class="tab-btn" data-tab="config">设置</button>
+      <button class="tab-btn" data-tab="logs">日志</button>
+    </div>
+
+    <div class="sp-content">
+      <!-- 任务页 -->
+      <div id="tab-folders" class="tab-pane active">
+        <!-- 文件夹选择 -->
+        <section class="sp-card">
+          <div class="sp-card-header">
+            <h2>选择文件夹</h2>
+            <div class="sp-header-actions">
+              <button id="select-all" class="text-btn">全选</button>
+              <button id="deselect-all" class="text-btn">清空</button>
+              <button id="refresh-folders" class="text-btn">🔄刷新</button>
+            </div>
+          </div>
+          <div id="folder-list" class="sp-folder-list">
+            <div class="sp-placeholder">正在加载文件夹...</div>
+          </div>
+        </section>
+
+        <!-- 导出状态 -->
+        <section id="progress-section" class="sp-card hidden">
+          <h2>执行进度</h2>
+          <div class="sp-progress-box">
+            <div class="sp-progress-info">
+              <span id="progress-folder">等待开始</span>
+              <span id="progress-percent">0%</span>
+            </div>
+            <div class="sp-progress-track">
+              <div id="progress-fill" class="sp-progress-fill"></div>
+            </div>
+            <div class="sp-metrics">
+              <div class="sp-metric">
+                <span class="label">笔记</span>
+                <span id="progress-notes" class="value">0</span>
+              </div>
+              <div class="sp-metric">
+                <span class="label">图片</span>
+                <span id="progress-images" class="value">0</span>
+              </div>
+            </div>
+            <div class="sp-current-task">
+              <span id="current-note-title">就绪</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 设置页 -->
+      <div id="tab-config" class="tab-pane">
+        <section class="sp-card">
+          <h2>导出偏好</h2>
+          <div class="sp-config-group">
+            <label>内容类型</label>
+            <div class="sp-radio-group">
+              <label class="radio-item"><input type="radio" name="export-type" value="full" checked> <span>完整</span></label>
+              <label class="radio-item"><input type="radio" name="export-type" value="text-only"> <span>纯文本</span></label>
+            </div>
+          </div>
+          <div class="sp-config-group" id="image-options">
+            <label class="sp-switch">
+              <span>下载图片</span>
+              <input type="checkbox" id="download-images" checked>
+            </label>
+            <div class="sp-input-field">
+              <label>保存目录</label>
+              <input type="text" id="image-folder" value="images" placeholder="images">
+            </div>
+          </div>
+        </section>
+
+        <section class="sp-card">
+          <h2>反爬虫设置</h2>
+          <div class="sp-input-grid">
+            <div class="sp-input-field">
+              <label>最小延迟(ms)</label>
+              <input type="number" id="min-delay" value="1000">
+            </div>
+            <div class="sp-input-field">
+              <label>最大延迟(ms)</label>
+              <input type="number" id="max-delay" value="3000">
+            </div>
+            <div class="sp-input-field">
+              <label>批量大小</label>
+              <input type="number" id="batch-size" value="30">
+            </div>
+            <div class="sp-input-field">
+              <label>批量休息(s)</label>
+              <input type="number" id="batch-pause" value="15">
+            </div>
+          </div>
+          <div class="sp-config-actions">
+            <button id="btn-save-config" class="sp-btn sp-btn-primary sp-btn-sm">保存设置</button>
+            <button id="btn-reset-config" class="sp-btn sp-btn-outline sp-btn-sm">重置默认</button>
+          </div>
+        </section>
+      </div>
+
+      <!-- 日志页 -->
+      <div id="tab-logs" class="tab-pane">
+        <section class="sp-card">
+          <div class="sp-card-header">
+            <h2>运行日志</h2>
+            <button id="clear-logs" class="text-btn">清空</button>
+          </div>
+          <div id="log-container" class="sp-log-viewport"></div>
+        </section>
+      </div>
+    </div>
+
+    <footer class="sp-footer">
+      <div class="sp-footer-info">
+        已选 <span id="selected-count">0</span> 个文件夹
+      </div>
+      <div class="sp-action-btns">
+        <button id="btn-start" class="sp-btn sp-btn-primary">开始导出任务</button>
+        <button id="btn-pause" class="sp-btn sp-btn-warning hidden">暂停</button>
+        <button id="btn-resume" class="sp-btn sp-btn-success hidden">继续</button>
+        <button id="btn-stop" class="sp-btn sp-btn-danger hidden">停止</button>
+      </div>
+    </footer>
+  </div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
