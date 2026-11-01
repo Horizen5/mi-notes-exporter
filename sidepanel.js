@@ -458,7 +458,9 @@ async function saveConfig() {
     imageThrottleMs: config.imageThrottleMs,
     packMode: config.packMode,
     resume: config.resume,
-    useCloudIndex: config.useCloudIndex
+    useCloudIndex: config.useCloudIndex,
+    // 配置结构版本：v2 起 zip 成为默认打包方式，见 loadSavedSettings 的一次性迁移
+    defaultsVersion: 2
   };
 
   chrome.storage.local.set({ 'miNotesSettings': settingsToSave }, () => {
@@ -491,7 +493,17 @@ async function loadSavedSettings() {
         if (s.outputDir !== undefined) document.getElementById('output-dir').value = s.outputDir;
         if (s.imageConcurrency) document.getElementById('image-concurrency').value = s.imageConcurrency;
         if (s.imageThrottleMs !== undefined) document.getElementById('image-throttle').value = s.imageThrottleMs;
-        if (s.packMode) document.getElementById('pack-mode').value = s.packMode;
+        // 打包方式默认值在 v1.11.4 从「逐个文件」改成「zip」。
+        // 老配置里存的 files 只是旧默认值，不代表用户选择，所以迁移一次；
+        // 迁移后写入 defaultsVersion，用户之后自己改的选择不会再被覆盖。
+        if (!s.defaultsVersion) {
+          document.getElementById('pack-mode').value = 'zip';
+          chrome.storage.local.set({
+            miNotesSettings: Object.assign({}, s, { packMode: 'zip', defaultsVersion: 2 })
+          });
+        } else if (s.packMode) {
+          document.getElementById('pack-mode').value = s.packMode;
+        }
         if (s.resume !== undefined) document.getElementById('resume-export').checked = s.resume;
         if (s.useCloudIndex !== undefined) document.getElementById('cloud-index').checked = s.useCloudIndex;
         
@@ -515,7 +527,7 @@ function resetConfig() {
     outputDir: '',
     imageConcurrency: 4,
     imageThrottleMs: 120,
-    packMode: 'files',
+    packMode: 'zip',
     resume: true,
     useCloudIndex: true
   };

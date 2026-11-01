@@ -149,7 +149,7 @@ const MiNotesExporter = {
     // 断点续传：命中缓存时直接复用上次的提取结果，不再点开笔记、不再下图片
     resume: true,
     // 打包方式：files = 逐个文件（可直接进 Obsidian），zip = 每个文件夹打成一个压缩包
-    packMode: 'files',
+    packMode: 'zip',
     // 云端清单：用接口拿文件夹与笔记的权威元数据（条数、修改时间）。
     // 只读元数据，正文仍然走页面 DOM，所以转换质量不变。接口不可用时自动退回纯 DOM 模式。
     useCloudIndex: true
