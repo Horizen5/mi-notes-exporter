@@ -77,24 +77,105 @@ function bindEvents() {
   });
 }
 
-async function loadFolders() {
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// 扩展更新后，页面里注入的是旧版脚本，消息发不进去（Receiving end does not exist）。
+// 这时自动重载一次页面就等于用户按 F5，之后新脚本接管，不需要用户自己记得刷新。
+let autoReloadedForStaleScript = false;
+let lastSyncOk = null;
+let isReloading = false;
+
+async function loadFolders(opts = {}) {
   try {
-    updateStatus('busy', '同步中...');
+    if (!opts.silent) updateStatus('busy', '同步中...');
     const response = await sendMessageToContent({ action: 'getFolders' });
-    if (response && response.success && response.folders) {
-      folders = response.folders;
-      const exported = await getExportedFolderSet();
-      renderFolders(folders, exported);
-      updateStatus('online', '已同步');
-      updateSelectedCount();
-    } else throw new Error('获取失败');
+    if (!(response && response.success && response.folders)) {
+      throw new Error((response && response.error) || '获取失败');
+    }
+    folders = response.folders;
+    const exported = await getExportedFolderSet();
+    renderFolders(folders, exported);
+    updateStatus('online', '已同步');
+    updateSelectedCount();
+    lastSyncOk = true;
+    return true;
   } catch (err) {
+    const stale = err && err.code === 'NO_RECEIVER';
+
+    if (stale && !autoReloadedForStaleScript) {
+      autoReloadedForStaleScript = true;
+      addLog('页面里的脚本和扩展版本对不上（扩展刚更新时就是这样），正在自动重载页面…', 'warning');
+      updateStatus('busy', '正在重载页面...');
+      if (await reloadAndWaitSync()) return true;
+    }
+
+    lastSyncOk = false;
+
+    // 侧边栏自己的上下文失效：只能重开侧边栏，重载页面也救不了
+    if (err && err.code === 'CONTEXT_INVALID') {
+      updateStatus('offline', '请重新打开侧边栏');
+      addLog('扩展刚更新过，这个侧边栏的上下文已经失效。关掉侧边栏重新点图标打开就能恢复。', 'warning');
+      return false;
+    }
+
     updateStatus('offline', '同步失败');
-    // 如果是刷新过程中的尝试，不直接报错日志，保持静默重试
-    if (!isRefreshing) {
-      addLog('无法获取文件夹，请确保页面已加载。', 'error');
+    // 刷新过程中的尝试保持静默，避免日志里刷屏
+    if (!isRefreshing && !opts.silent) {
+      addLog(
+        stale
+          ? '页面还没就绪：点「刷新」会自动重载页面并重新同步，不用手动按 F5。'
+          : '无法获取文件夹，请确保页面已加载并已登录。',
+        'error'
+      );
+    }
+    return false;
+  }
+}
+
+// 重载小米笔记标签页，然后轮询等新的 content script 接管
+async function reloadAndWaitSync(maxAttempts = 20) {
+  let tab;
+  try {
+    tab = await getTargetTab();
+  } catch (e) {
+    addLog('找不到小米笔记标签页，请在 i.mi.com 打开笔记后重试。', 'error');
+    return false;
+  }
+
+  isReloading = true;
+  try {
+    await chrome.tabs.reload(tab.id);
+  } catch (e) {
+    isReloading = false;
+    addLog('重载页面的请求被拒绝：' + e.message, 'error');
+    return false;
+  }
+
+  for (let i = 0; i < maxAttempts; i++) {
+    await sleep(800);
+    try {
+      const res = await sendMessageToContent({ action: 'getFolders' });
+      if (res && res.success && res.folders) {
+        folders = res.folders;
+        const exported = await getExportedFolderSet();
+        renderFolders(folders, exported);
+        updateStatus('online', '已同步');
+        updateSelectedCount();
+        lastSyncOk = true;
+        isReloading = false;
+        addLog(`页面已重载，文件夹同步成功（${res.folders.length} 个）。`, 'success');
+        return true;
+      }
+    } catch (e) {
+      // 页面还在加载，继续等
     }
   }
+
+  isReloading = false;
+  lastSyncOk = false;
+  updateStatus('offline', '同步超时');
+  addLog('重载后仍然同步不上。确认页面已登录后点「刷新」再试一次。', 'error');
+  return false;
 }
 
 // 读取“已导出文件夹”记录：用于默认不勾选已导出的文件夹
@@ -113,67 +194,24 @@ let isRefreshing = false;
 async function refreshPageAndFolders() {
   if (isRefreshing) return;
   isRefreshing = true;
-  
+
   updateStatus('busy', '正在刷新...');
   addLog('正在刷新页面并重新同步数据...', 'info');
 
   try {
-    // 1. 寻找小米笔记标签页
+    // 没有小米笔记标签页就先开一个；有就重载它
     const tabs = await chrome.tabs.query({ url: "*://i.mi.com/note/*" });
-    
-    if (tabs.length > 0) {
-      // 刷新现有标签页并激活
-      const targetTab = tabs[0];
-      await chrome.tabs.reload(targetTab.id);
-      await chrome.tabs.update(targetTab.id, { active: true });
-      currentTab = targetTab;
-    } else {
-      // 没找到则新建
+    if (tabs.length === 0) {
       currentTab = await chrome.tabs.create({ url: 'https://i.mi.com/note/h5#/' });
+      await sleep(2500);
     }
-
-    // 2. 轮询尝试重新同步，直到页面加载完成
-    let attempts = 0;
-    const maxAttempts = 15;
-    
-    const pollSync = async () => {
-      if (attempts >= maxAttempts) {
-        isRefreshing = false;
-        updateStatus('offline', '同步超时');
-        addLog('同步超时，请确保页面已完全加载并登录。', 'error');
-        return;
-      }
-      
-      attempts++;
-      try {
-        // 确保获取最新的标签页状态
-        const activeTabs = await chrome.tabs.query({ active: true, currentWindow: true });
-        if (activeTabs.length > 0 && activeTabs[0].url.includes('i.mi.com')) {
-          currentTab = activeTabs[0];
-          const response = await sendMessageToContent({ action: 'getFolders' });
-          if (response && response.success) {
-            folders = response.folders;
-            const exported = await getExportedFolderSet();
-            renderFolders(folders, exported);
-            updateStatus('online', '已同步');
-            updateSelectedCount();
-            addLog('页面已刷新，数据同步成功。', 'success');
-            isRefreshing = false;
-            return;
-          }
-        }
-      } catch (e) {}
-      
-      // 每 1.5 秒重试一次
-      setTimeout(pollSync, 1500);
-    };
-
-    // 延迟 2 秒开始轮询，给浏览器刷新留出启动时间
-    setTimeout(pollSync, 2000);
-
+    // 重载成功会写日志并把状态更新成「已同步」
+    await reloadAndWaitSync();
   } catch (err) {
-    isRefreshing = false;
     addLog('刷新操作失败: ' + err.message, 'error');
+    updateStatus('offline', '同步失败');
+  } finally {
+    isRefreshing = false;
   }
 }
 
@@ -330,13 +368,52 @@ function addLog(msg, type = 'info') {
   box.scrollTop = box.scrollHeight;
 }
 
-// 给 content script 发消息（在当前 i.mi.com 标签页里）
+// 取当前小米笔记标签页。每次都重新取，避免侧边栏开久了拿着过期的 tabId。
+async function getTargetTab() {
+  try {
+    const active = await chrome.tabs.query({ active: true, currentWindow: true });
+    const hit = active.find(t => t.url && t.url.includes('i.mi.com'));
+    if (hit) {
+      currentTab = hit;
+      return hit;
+    }
+  } catch (e) {}
+
+  if (currentTab && currentTab.id != null) return currentTab;
+
+  const tabs = await chrome.tabs.query({ url: "*://i.mi.com/*" });
+  if (tabs.length > 0) {
+    currentTab = tabs[0];
+    return tabs[0];
+  }
+  throw new Error('当前标签不是小米笔记页面');
+}
+
+// 给 content script 发消息。
+// 关键：把「页面里没有接收端」和「其它失败」区分开——前者说明脚本没注入或已因扩展更新失效，
+// 上层据此决定要不要自动重载页面，而不是干巴巴报一句"同步失败"。
 async function sendMessageToContent(msg) {
+  const tab = await getTargetTab();
   return new Promise((resolve, reject) => {
-    chrome.tabs.sendMessage(currentTab.id, msg, (res) => {
-      if (chrome.runtime.lastError) reject(new Error('通信失败'));
-      else resolve(res);
-    });
+    try {
+      chrome.tabs.sendMessage(tab.id, msg, (res) => {
+        if (chrome.runtime.lastError) {
+          const text = chrome.runtime.lastError.message || '';
+          const err = new Error(text || '通信失败');
+          err.code = /Receiving end|Could not establish|message port closed before/i.test(text)
+            ? 'NO_RECEIVER'
+            : 'FAILED';
+          reject(err);
+          return;
+        }
+        resolve(res);
+      });
+    } catch (e) {
+      // 扩展被更新或重载时，侧边栏自身的上下文会失效，Chrome 直接抛异常
+      const err = new Error(e.message || '扩展上下文已失效');
+      err.code = /context invalidated/i.test(String(e.message)) ? 'CONTEXT_INVALID' : 'FAILED';
+      reject(err);
+    }
   });
 }
 
@@ -352,6 +429,16 @@ async function applyConfigToContent() {
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'progress') updateProgress(msg.data);
   else if (msg.action === 'log') addLog(msg.data.message, msg.data.type);
+});
+
+// 页面加载完成时自动补一次同步。
+// 覆盖两种情形：用户自己按了 F5（面板不用再点刷新）；扩展更新后页面被重载。
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete') return;
+  if (!tab || !tab.url || !tab.url.includes('i.mi.com')) return;
+  if (isRefreshing || isReloading) return;   // 刷新流程自己会轮询，别插一脚
+  if (lastSyncOk === true) return;           // 已经同步好的不打扰
+  loadFolders({ silent: true });
 });
 
 // 保存配置到本地存储
