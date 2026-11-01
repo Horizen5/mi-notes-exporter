@@ -287,31 +287,44 @@ const MiNotesExporter = {
     };
 
     const index = await this.ensureCloudIndex();
+    const domNames = await readDomFolders(index.ok ? 1500 : 5000);
+
+    // 接口给的是名称 -> 真实条数
+    const apiCount = new Map();
     if (index.ok) {
-      const fromApi = index.folders
+      index.folders
         .filter(f => f.name && !excludeFolders.includes(f.name))
-        .map(f => ({ name: f.name, noteCount: String(f.count) }));
-
-      if (fromApi.length > 0) {
-        // 接口没返回的文件夹用页面列表补上。私密笔记就是典型：
-        // 它的内容不进 /note/full/page/，所以接口的 folders 里根本没有它。
-        const domNames = await readDomFolders(1500);
-        const known = new Set(fromApi.map(f => normName(f.name)));
-        const extra = domNames.filter(n => !known.has(normName(n)));
-
-        if (extra.length > 0) {
-          extra.forEach(name => fromApi.push({ name, noteCount: '-' }));
-          this.log(`接口未返回、已从页面补上 ${extra.length} 个文件夹：${extra.join('、')}`, 'info');
-        }
-        this.log(`文件夹列表：${fromApi.length} 个，共 ${index.notes.length} 条笔记`, 'info');
-        return fromApi;
-      }
+        .forEach(f => apiCount.set(normName(f.name), { name: f.name, count: String(f.count) }));
     } else if (index.reason !== 'disabled') {
       this.log(this.describeCloudFailure(index) + '，改用页面解析', 'warning');
     }
 
-    const domFolders = await readDomFolders(5000);
-    return domFolders.map(name => ({ name, noteCount: '-' }));
+    // 顺序以左侧侧边栏为准：导出面板的排列和用户在页面上看到的顺序一致，
+    // 按位置找文件夹时不会错位。接口没返回的（私密笔记）也就落在它本来该在的位置上，
+    // 而不是被追加到列表末尾。
+    const ordered = [];
+    const seen = new Set();
+
+    domNames.forEach(name => {
+      const key = normName(name);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      const hit = apiCount.get(key);
+      // 名字用侧边栏显示的写法（用户就是这么认的），条数用接口的
+      ordered.push({ name: hit ? hit.name : name, noteCount: hit ? hit.count : '-' });
+    });
+
+    // 接口有、侧边栏没读到的，追加到末尾，宁可多显示也不要静默漏掉
+    apiCount.forEach((v, key) => {
+      if (seen.has(key)) return;
+      seen.add(key);
+      ordered.push({ name: v.name, noteCount: v.count });
+    });
+
+    if (index.ok && ordered.length > 0) {
+      this.log(`文件夹列表：${ordered.length} 个（按侧边栏顺序），共 ${index.notes.length} 条笔记`, 'info');
+    }
+    return ordered;
   },
 
   // 从侧边栏文件夹 DOM 节点中提取文件夹名称
@@ -1885,6 +1898,9 @@ const MiNotesExporter = {
   async downloadFolderZip(folderName, suffix, markdownText, jsonData) {
     const sanitized = this.sanitizeFilename(folderName);
     const images = this.zipBuffer[folderName] || [];
+    // 命名契约：外层压缩包 = 文件夹名，例如导出「私密笔记」就是 私密笔记.zip；
+    // 包内 md / json 与逐个文件模式同名，图片放 images/ 子目录。
+    // 只有中途停止的才带 _未全部导出 后缀，用来区分不完整产物。
     const zipName = `${sanitized}${suffix}.zip`;
     const startedAt = Date.now();
 
