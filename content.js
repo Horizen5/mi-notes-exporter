@@ -150,6 +150,9 @@ const MiNotesExporter = {
     resume: true,
     // 打包方式：files = 逐个文件（可直接进 Obsidian），zip = 每个文件夹打成一个压缩包
     packMode: 'zip',
+    // 标题样式：笔记本身没写标题时（列表里那行只是正文预览）怎么渲染标题行
+    // placeholder = 浅灰「无标题」 / blank = 留空标题 / plain = 普通「无标题」 / none = 不输出
+    titleStyle: 'placeholder',
     // 云端清单：用接口拿文件夹与笔记的权威元数据（条数、修改时间）。
     // 只读元数据，正文仍然走页面 DOM，所以转换质量不变。接口不可用时自动退回纯 DOM 模式。
     useCloudIndex: true
@@ -1992,12 +1995,44 @@ const MiNotesExporter = {
     markdown += `> 请将下载的图片放入 ${this.config.imageFolderName} 文件夹\n\n---\n\n`;
 
     notes.forEach(note => {
-      markdown += `## ${note.title}\n\n`;
+      markdown += this.renderNoteHeading(note);
       if (note.time) markdown += `> 创建时间: ${this.formatTime(note.time)}\n\n`;
       markdown += `${note.markdown || note.text}\n\n---\n\n`;
     });
 
     return markdown;
+  },
+
+  // 这条笔记是否真的写了标题。
+  // 小米笔记列表里显示的那一行「标题」，在笔记没写标题时其实是正文开头的预览，
+  // 直接拿来当标题会跟正文首段重复，所以用「正文是否以它开头」来区分。
+  hasRealTitle(note) {
+    const rawTitle = String((note && note.title) || '').trim();
+    if (!rawTitle || rawTitle === '无标题') return false;
+    const body = String((note && (note.markdown || note.text)) || '');
+    const norm = (s) => String(s)
+      .replace(/\s+/g, '')
+      .replace(/[*_`>#~\-\[\]()（）【】「」《》"'.,，。！？!?：:；;…]/g, '');
+    const title = norm(rawTitle);
+    const text = norm(body);
+    if (!title) return false;
+    if (!text) return true;
+    // 正文以这段文字开头 → 它只是列表预览，不算标题
+    return !text.startsWith(title);
+  },
+
+  // 渲染单条笔记的标题行
+  renderNoteHeading(note) {
+    const style = this.config.titleStyle || 'placeholder';
+    if (style === 'none') return '';
+    if (this.hasRealTitle(note)) {
+      return `## ${String(note.title).trim()}\n\n`;
+    }
+    if (style === 'blank') return `##\n\n`;
+    if (style === 'plain') return `## 无标题\n\n`;
+    // 浅灰占位：Obsidian / Typora 会按 HTML 渲染成灰色小字，
+    // 不支持的阅读器里会退化成普通的「无标题」文字，不会丢内容
+    return `## <span style="color:#9aa3af;font-weight:400">无标题</span>\n\n`;
   },
 
   // 保存 Markdown 到输出目录（必须走后台下载，页面内 a 标签无法写入子目录）

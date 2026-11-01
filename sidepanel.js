@@ -257,6 +257,7 @@ function getConfig() {
     imageConcurrency: Math.min(8, Math.max(1, parseInt(document.getElementById('image-concurrency').value) || 4)),
     imageThrottleMs: Math.max(0, parseInt(document.getElementById('image-throttle').value) || 0),
     packMode: document.getElementById('pack-mode').value,
+    titleStyle: document.getElementById('title-style').value,
     resume: document.getElementById('resume-export').checked,
     useCloudIndex: document.getElementById('cloud-index').checked,
     noteLoadDelay: 1500,
@@ -457,6 +458,7 @@ async function saveConfig() {
     imageConcurrency: config.imageConcurrency,
     imageThrottleMs: config.imageThrottleMs,
     packMode: config.packMode,
+    titleStyle: config.titleStyle,
     resume: config.resume,
     useCloudIndex: config.useCloudIndex,
     // 配置结构版本：v2 起 zip 成为默认打包方式，见 loadSavedSettings 的一次性迁移
@@ -504,6 +506,7 @@ async function loadSavedSettings() {
         } else if (s.packMode) {
           document.getElementById('pack-mode').value = s.packMode;
         }
+        if (s.titleStyle) document.getElementById('title-style').value = s.titleStyle;
         if (s.resume !== undefined) document.getElementById('resume-export').checked = s.resume;
         if (s.useCloudIndex !== undefined) document.getElementById('cloud-index').checked = s.useCloudIndex;
         
@@ -528,6 +531,7 @@ function resetConfig() {
     imageConcurrency: 4,
     imageThrottleMs: 120,
     packMode: 'zip',
+    titleStyle: 'placeholder',
     resume: true,
     useCloudIndex: true
   };
@@ -548,6 +552,7 @@ function resetConfig() {
   document.getElementById('image-concurrency').value = defaults.imageConcurrency;
   document.getElementById('image-throttle').value = defaults.imageThrottleMs;
   document.getElementById('pack-mode').value = defaults.packMode;
+  document.getElementById('title-style').value = defaults.titleStyle;
   document.getElementById('resume-export').checked = defaults.resume;
   document.getElementById('cloud-index').checked = defaults.useCloudIndex;
 
