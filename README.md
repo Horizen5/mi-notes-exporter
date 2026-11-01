@@ -8,6 +8,8 @@
 
 一个用于批量导出小米云服务笔记的 Chrome 浏览器扩展工具。支持导出为 Markdown 格式，自动下载笔记中的图片，支持文件夹选择、暂停/继续功能。
 
+> 安装步骤、设置项说明、常见问题都写在 [docs/使用说明.md](docs/使用说明.md) 里。安装包在 [Releases](https://github.com/Horizen5/mi-notes-exporter/releases) 页。
+
 ## ✨ 功能特性
 
 - ✅ **批量导出**：支持一次性导出多个文件夹的笔记
