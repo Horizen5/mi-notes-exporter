@@ -1,5 +1,19 @@
 # 小米笔记导出工具 更新日志
 
+## [v1.9.5] - 2026-11-01
+
+### 🐛 修复（均为确定性 bug，不改动抓取架构）
+
+- **修复图片下载失败导致整个导出永久卡死**：`downloadImage` 在 `chrome.runtime.sendMessage` 回调里 `throw`，该回调不在 Promise executor 内，Promise 永远不 settle，`await` 永久挂起，暂停/停止都无法生效（对应旧 FAQ 里"页面卡住不动"）。现在改为：成功 / 失败 / 超时(30s) 三条路径都 resolve，失败只记日志并继续下一条。
+- **修复所有 PNG 被存成 .jpg**：`filename.replace(/\.png$/, extension)` 永远不匹配（文件名生成时固定以 `.jpg` 结尾），MIME 识别结果一次都没生效。改为按末尾扩展名整体替换。
+- **修复图片文件名互相覆盖**：NoteID 哈希后缀从 4 位扩到 8 位，降低同文件夹同日期撞名概率（`chrome.downloads` 用的是 `conflictAction: 'overwrite'`，撞名即静默覆盖）。
+- **修复文件夹名可能全部退化为"未命名文件夹"**：`getFolderName` 原来只认写死的 `.text-10cyJ`，小米前端重新编译后哈希类名必变。改为三级兜底 + 空值过滤。
+
+### ⚙️ 行为变更
+
+- `maxImageSize`（默认 10MB）开始真正生效：超过上限的图片跳过并记 `warning` 日志，不再把超大 base64 塞进消息通道。此前该配置项只有定义、全文无人读取。
+- 版本号 1.9.4 → 1.9.5；README 中图片命名规则同步为"哈希8位"。
+
 ## [v1.9.4] - 2026-03-31
 
 ### 🔄 滑动窗口同步（Sliding Window Sync）

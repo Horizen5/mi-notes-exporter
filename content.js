@@ -108,9 +108,17 @@ const MiNotesExporter = {
   },
 
   // 从侧边栏文件夹 DOM 节点中提取文件夹名称
+  // 注意：小米前端每次发版都会重编 CSS Module 哈希（.text-xxxxx 这类后缀必然变），
+  // 所以这里必须三级兜底，不能只认一个写死的类名，否则改版后所有文件夹名会一起退化成"未命名文件夹"
   getFolderName(folder) {
-    const textEl = folder.querySelector('.text-10cyJ');
-    return textEl ? textEl.innerText.trim() : '未命名文件夹';
+    const textEl =
+      folder.querySelector('.text-10cyJ') ||
+      folder.querySelector('[class*="text-"]') ||
+      folder.querySelector('[class*="name"]') ||
+      folder.querySelector('span, div');
+
+    const name = textEl ? (textEl.innerText || '').trim() : '';
+    return name || '未命名文件夹';
   },
 
   // 校验登录状态：导出前/批量过程中用于判断是否掉线
@@ -893,9 +901,10 @@ const MiNotesExporter = {
     return `${year}${month}${day}`;
   },
 
-  // 从 noteId 提取末4位哈希
+  // 从 noteId 生成 8 位哈希后缀
+  // 原来只取 4 位：同文件夹、同一天的两条笔记一旦撞车，图片会互相覆盖（下载用的是 overwrite，静默覆盖）
   extractNoteIdSuffix(noteId) {
-    if (!noteId) return '0000';
+    if (!noteId) return '00000000';
     // 对 noteId 进行简单哈希
     let hash = 0;
     for (let i = 0; i < noteId.length; i++) {
@@ -903,9 +912,9 @@ const MiNotesExporter = {
       hash = ((hash << 5) - hash) + char;
       hash = hash & hash;
     }
-    // 取绝对值并转为16进制，取后4位
+    // 取绝对值并转为16进制，取后8位
     const hex = Math.abs(hash).toString(16).toUpperCase();
-    return hex.slice(-4).padStart(4, '0');
+    return hex.slice(-8).padStart(8, '0');
   },
 
   // 处理正文中的图片：抓取图片链接并下载为本地文件，返回用于替换的映射表
@@ -921,7 +930,7 @@ const MiNotesExporter = {
     const folderPrefix = this.cleanFilename(this.sanitizeFilename(folderName));
     // 提取日期 YYMMDD
     const dateStr = this.extractDateFromTime(noteTime);
-    // 提取 NoteID 末4位
+    // 提取 NoteID 哈希后缀（8 位）
     const noteIdSuffix = this.extractNoteIdSuffix(noteId);
 
     for (let i = 0; i < imgElements.length; i++) {
@@ -936,7 +945,7 @@ const MiNotesExporter = {
       // 构建完整的URL
       const fullUrl = new URL(src, window.location.origin).href;
 
-      // 新的文件名格式：文件夹名_YYMMDD_NoteID末4位_序号.jpg
+      // 文件名格式：文件夹名_YYMMDD_NoteID哈希8位_序号.jpg
       const filename = `${folderPrefix}_${dateStr}_${noteIdSuffix}_${i + 1}.jpg`;
 
       // 使用随机延迟下载图片
@@ -992,10 +1001,15 @@ const MiNotesExporter = {
   },
 
   // 下载单张图片：在 content script 中携带登录态 fetch -> blob -> base64 -> 交给后台保存
+  // 关键约定：本函数无论成功、失败、超时都必须 resolve，绝不能挂起。
+  // 旧实现在 sendMessage 回调里 throw，回调不在 Promise executor 里，Promise 永远不会 settle，
+  // await 会永久等待 —— 这就是"导出过程卡住不动、暂停也没用"的根因。
   async downloadImage(url, filename) {
     try {
+      const maxSize = this.config.maxImageSize || 10 * 1024 * 1024;
+
       this.log(`正在抓取图片: ${filename}`, 'info');
-      
+
       // 1. 在前端通过 fetch 抓取图片（利用当前登录会话）
       const response = await fetch(url, {
         method: 'GET',
@@ -1005,12 +1019,26 @@ const MiNotesExporter = {
 
       if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
 
-      // 2. 将图片转换为 Base64 数据流（并识别后缀名）
+      // 2. 体积预检：超过上限直接跳过，避免 base64 过消息通道时撑爆内存
       const blob = await response.blob();
+
+      if (blob.size > maxSize) {
+        this.failedImages++;
+        this.log(
+          `⏭ 跳过超大图片: ${filename} ` +
+          `(${(blob.size / 1024 / 1024).toFixed(1)}MB > ${(maxSize / 1024 / 1024).toFixed(0)}MB)`,
+          'warning'
+        );
+        return null;
+      }
+
       const mimeType = blob.type; // 获取真实的 MIME 类型
       const extension = this.getExtensionFromMime(mimeType);
-      const finalFilename = filename.replace(/\.png$/, extension);
+      // 旧写法 filename.replace(/\.png$/, extension) 永远不生效：
+      // filename 生成时固定以 .jpg 结尾，正则匹配不到，导致所有 PNG 都被存成 .jpg
+      const finalFilename = filename.replace(/\.[A-Za-z0-9]+$/, '') + extension;
 
+      // 3. 将 Base64 数据流发送给后台执行下载
       const base64data = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(reader.result);
@@ -1018,20 +1046,38 @@ const MiNotesExporter = {
         reader.readAsDataURL(blob);
       });
 
-      // 3. 将 Base64 数据流发送给后台执行下载
-      return new Promise((resolve) => {
+      // 4. 交给后台下载，带 30 秒兜底超时，保证一定会返回
+      return await new Promise((resolve) => {
+        let settled = false;
+        let timer = null;
+
+        const finish = (value) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          resolve(value);
+        };
+
+        timer = setTimeout(() => {
+          this.failedImages++;
+          this.log(`✗ 下载超时(30s): ${filename}`, 'error');
+          finish(null);
+        }, 30000);
+
         chrome.runtime.sendMessage({
           action: 'downloadFile',
-          url: base64data, 
+          url: base64data,
           filename: finalFilename,
           folder: this.config.imageFolderName
         }, (res) => {
           if (res && res.success) {
             this.downloadedImages++;
             this.log(`✓ 下载成功: ${this.config.imageFolderName}/${finalFilename}`, 'success');
-            resolve(finalFilename); // 返回真实的带后缀的文件名
+            finish(finalFilename); // 返回真实的带后缀的文件名
           } else {
-            throw new Error(res?.error || '下载请求失败');
+            this.failedImages++;
+            this.log(`✗ 下载失败: ${filename} - ${res?.error || '后台无响应'}`, 'error');
+            finish(null);
           }
         });
       });

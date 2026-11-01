@@ -150,7 +150,7 @@ git clone https://github.com/Horizen5/mi-notes-exporter.git
 
 ### 图片命名规则
 
-图片文件命名格式：`文件夹名_YYMMDD_NoteID末4位_序号.jpg`
+图片文件命名格式：`文件夹名_YYMMDD_NoteID哈希8位_序号.jpg`
 
 例如：`工作_260315_ABCD_1.jpg`
 
