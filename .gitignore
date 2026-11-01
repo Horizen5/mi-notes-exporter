@@ -6,3 +6,12 @@ Thumbs.db
 desktop.ini
 *.crx
 *.pem
+
+# root 方式拉下来的数据与导出结果，都是手机里的原文，不进仓库
+root/dump/
+root/便签导出/
+*.tgz
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc

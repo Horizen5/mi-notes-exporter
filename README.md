@@ -6,9 +6,37 @@
 ![GitHub issues](https://img.shields.io/github/issues/Horizen5/mi-notes-exporter)
 ![License](https://img.shields.io/github/license/Horizen5/mi-notes-exporter)
 
-一个用于批量导出小米云服务笔记的 Chrome 浏览器扩展工具。支持导出为 Markdown 格式，自动下载笔记中的图片，支持文件夹选择、暂停/继续功能。
+一个用于批量导出小米笔记的工具，包含两套互不依赖的实现，按你手机上有没有 root 选一套即可。
 
-> 安装步骤、设置项说明、常见问题都写在 [docs/使用说明.md](docs/使用说明.md) 里。安装包在 [Releases](https://github.com/Horizen5/mi-notes-exporter/releases) 页。
+|  | 方式一 · 浏览器扩展 | 方式二 · Root 脚本 |
+|---|---|---|
+| 需要 root | 不需要 | 需要（Magisk / KernelSU） |
+| 数据来源 | 小米云 `i.mi.com` | 手机本地 `note.db` |
+| 系统 | 任意电脑 | MIUI / HyperOS 均可，包名都是 `com.miui.notes` |
+| 私密笔记 | 拿不到解密后的正文 | **可解成明文**，原理见 [加密原理](docs/原理-私密笔记加密.md) |
+| 图片 | 逐张下载，受反爬限流 | 原图直出，277 MB 一次到位 |
+| 产物 | 一个文件夹一个 md | 一条便签一个 md + 可搜索的 HTML 全集 |
+| 说明 | [docs/使用说明.md](docs/使用说明.md) | [docs/使用说明-root.md](docs/使用说明-root.md) |
+
+安装包在 [Releases](https://github.com/Horizen5/mi-notes-exporter/releases) 页。下面先是方式一的完整说明，方式二的代码在 [`root/`](root/) 目录。
+
+## 🧭 目录
+
+```
+├── manifest.json 等    方式一：Chrome 扩展（MV3）
+├── root/               方式二：root 脚本
+│   ├── pull.py           手机端打包 + adb 拉取 + 解包
+│   ├── decrypt.py        解密私密笔记
+│   └── export.py         note.db → HTML / Markdown / 图片总览
+└── docs/
+    ├── 使用说明.md            方式一：安装与设置
+    ├── 使用说明-root.md       方式二：前置条件与排错
+    └── 原理-私密笔记加密.md    AES-256-CBC 参数、IV 推导、密码为何不参与
+```
+
+---
+
+# 方式一：浏览器扩展
 
 ## ✨ 功能特性
 
@@ -271,6 +299,54 @@ v1.11.4 之后本扩展自己也注册了这个监听，会重新把「私密笔
 
 注意：快速配置可能导致被小米云服务限制访问，请谨慎使用。
 
+# 方式二：Root 全量导出
+
+不经过云端，直接从手机本地数据库导出。数据库、图片、密钥一次全拿到，私密笔记也能解成明文。
+
+完整说明见 [docs/使用说明-root.md](docs/使用说明-root.md)。
+
+## 为什么必须 root
+
+`/data/data/com.miui.notes` 是 `drwx------`，owner 是便签应用自己的 uid（实测 `u0_a237`），adb shell 跑在 `uid=2000`，进不去；`run-as` 也不行，因为小米便签不是 debuggable 版本；`adb backup` 在 Android 12 之后基本失效。只有 root 能直接读。
+
+## 三步走
+
+```bash
+cd root
+pip install -r requirements.txt
+
+python pull.py                 # 1. root 打包 + adb pull + 解包（约 20 秒 / 270 MB）
+python decrypt.py --sample 5   # 2. 看看私密笔记解出来对不对（可选）
+python export.py               # 3. 导出 HTML + Markdown
+```
+
+产物：
+
+```
+root/便签导出/
+├── index.html          左栏分类 + 搜索，图片内联，双击就开
+├── 图片总览.html        359 张图铺成网格，核对有没有缺
+├── index.md            按分类分组的索引
+├── 2017-11-25_323.md   一条便签一个文件，带 front-matter
+└── images/             原图，sha1 命名 + 正确扩展名
+```
+
+`index.html` 支持 `?cat=-4` 直接打开某个分类，图片是相对路径，整个文件夹丢进 Obsidian 也能直接看。
+
+## 脚本参数
+
+| 脚本 | 参数 | 说明 |
+|---|---|---|
+| `pull.py` | `--out` `--serial` `--adb` `--package` | 默认包名 `com.miui.notes`，默认输出 `./dump` |
+| `decrypt.py` | `--sample N` `--txt F` `--write` `--guess-iv` `--iv HEX` | `--write` 生成 `note.decrypted.db` |
+| `export.py` | `--dump` `--out` `--preview` `--no-secret` | 自动找 `files/miui_notes_secret_*` |
+
+## 私密笔记
+
+库里 26 条私密笔记是 AES-256-CBC 密文，密钥就是 `files/miui_notes_secret_2` 那 32 字节，IV 是固定常量，`export.py` 自动解密后当普通便签渲染。
+
+**你输的那个隐私密码跟密文没有关系** —— 密码只由系统校验，决定界面能不能进这个文件夹。详细的参数、IV 推导过程和「为什么说不用密码」的三条证据，见 [docs/原理-私密笔记加密.md](docs/原理-私密笔记加密.md)。
+
 ## 🔧 技术细节
 
 ### 扩展架构
@@ -292,6 +368,24 @@ v1.11.4 之后本扩展自己也注册了这个监听，会重新把「私密笔
 自动过滤文件名中的特殊字符：
 - `[ ] 【 】 ( ) （ ）` 等括号和空格会被移除
 - `\ / : * ? " < > |` 等非法字符会被替换为 `_`
+
+### 数据库结构（方式二）
+
+`note.db` 只有两张有用的表：
+
+- **`note`** — 一条记录一行，`type=0` 是真便签（750 条），`type=1` 是 19 个文件夹的实体行（`subject` 是文件夹名），`type=2` 是系统分类占位行（`_id=0` 未分类 233、`-4` 私密 26、`-3` 回收站）。便签靠 `parent_id` 挂到文件夹的 `_id` 上
+- **`data`** — 正文和图片行，靠 `mime_type` 区分：`vnd.android.cursor.item/text_note` 是正文，`image/jpeg` / `image/png` 是图片（`content` 是文件名 sha1）
+
+几个容易踩的点：`title` 只有 149/780 条有值（手机上看着像标题的其实是正文首行）；`has_attachment` 全为 0，判断有没有图只能查 `data` 表；`note_text_count` 不可信；文件夹排序不在 `sort` 字段（全是 0），而是 `subject` 升序。
+
+### 正文格式
+
+正文有新旧两代，同一条笔记里会混着用：
+
+- 旧：纯文本行，图片单独一行 `☺ <40位sha1>`
+- 新：XML 行，`<text indent="N">`、`<center>`、`<right>`、`<b>` `<u>` `<i>`、`<size>`、`<img fileid="sha1"/>`、`<input type="checkbox"/>`、`<hr/>`、`<background color="#RRGGBBAA">`
+
+两代的图片都指向 `files/attachment/` 里同名的文件，`export.py` 会统一归一化后按位置内联。
 
 ## 📋 更新日志
 
