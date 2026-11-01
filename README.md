@@ -345,7 +345,32 @@ root/便签导出/
 
 库里 26 条私密笔记是 AES-256-CBC 密文，密钥就是 `files/miui_notes_secret_2` 那 32 字节，IV 是固定常量，`export.py` 自动解密后当普通便签渲染。
 
-**你输的那个隐私密码跟密文没有关系** —— 密码只由系统校验，决定界面能不能进这个文件夹。详细的参数、IV 推导过程和「为什么说不用密码」的三条证据，见 [docs/原理-私密笔记加密.md](docs/原理-私密笔记加密.md)。
+**你输的那个隐私密码跟密文没有关系** —— 它只由系统校验，决定界面能不能进这个文件夹。
+
+### 加密链路
+
+**① 写库时加密** —— 这一步决定了密文长什么样：
+
+```mermaid
+flowchart LR
+    K["32 字节密钥<br/>files/miui_notes_secret_2"] -. 作为 key .-> B
+    A["明文<br/>一行行 XML"] --> B
+    V["IV 固定常量<br/>fc9710a0…4280face"] -. 作为 IV .-> B
+    B["AES-256-CBC<br/>PKCS7 填充"] --> C["Base64<br/>带换行的长串"] --> D[("note.db<br/>content 字段")]
+    classDef soft fill:transparent,stroke-dasharray:4 3
+    class K,V soft
+```
+
+**② 打开文件夹** —— 只走界面门禁，全程不碰密文：
+
+```mermaid
+flowchart LR
+    P["输入隐私密码<br/>手机端"] --> Q["系统校验通过<br/>MIUI / HyperOS 隐私保护"] --> R["私密笔记可见<br/>仅界面放行"]
+```
+
+密钥文件和密文放在同一个目录里，所以密码输错也不影响把正文算出来。
+
+详细的参数、IV 推导过程和「为什么说不用密码」的三条证据，见 [docs/原理-私密笔记加密.md](docs/原理-私密笔记加密.md)。
 
 ## 🔧 技术细节
 
