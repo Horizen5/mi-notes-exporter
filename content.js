@@ -262,7 +262,29 @@ const MiNotesExporter = {
   // 获取左侧文件夹列表（用于侧边栏展示与选择）
   // 优先走接口：自带真实条数，且不受侧边栏类名改版影响；接口不可用再退回读 DOM
   async getFolders() {
-    const excludeFolders = ['已完成', '未完成', '最近删除', '我的文件夹', '全部笔记', '私密笔记'];
+    // 只排除虚拟分类，不排除真实文件夹。
+    // 「最近删除」是回收站，「全部笔记」是所有文件夹的并集（留下来会把每条笔记导两遍），
+    // 「已完成 / 未完成」是待办的虚拟视图。
+    // 特别注意：不要排除「私密笔记」——它是用户真实存在的文件夹，
+    // v1.11.0 曾把它写进这张表，结果侧边栏里明明看得见、导出时却选不到。
+    const excludeFolders = ['已完成', '未完成', '最近删除', '我的文件夹', '全部笔记'];
+
+    const normName = (s) => String(s || '')
+      .replace(/[\s\u00a0]+/g, '')
+      .replace(/[（(][^）)]*[）)]/g, '')
+      .toLowerCase();
+
+    // 读侧边栏里的文件夹名，失败返回空数组（接口可用时这一步只是补充，不能让它拖垮整体）
+    const readDomFolders = async (timeout) => {
+      try {
+        await this.waitForElement('.sidebar-item-2LDWD, .sidebar-item-3IBBu', timeout);
+      } catch (e) {
+        return [];
+      }
+      return Array.from(document.querySelectorAll('.sidebar-item-2LDWD, .sidebar-item-3IBBu'))
+        .map(el => this.getFolderName(el))
+        .filter(name => name && name !== '未命名文件夹' && !excludeFolders.includes(name));
+    };
 
     const index = await this.ensureCloudIndex();
     if (index.ok) {
@@ -271,28 +293,25 @@ const MiNotesExporter = {
         .map(f => ({ name: f.name, noteCount: String(f.count) }));
 
       if (fromApi.length > 0) {
-        this.log(`文件夹列表来自接口：${fromApi.length} 个，共 ${index.notes.length} 条笔记`, 'info');
+        // 接口没返回的文件夹用页面列表补上。私密笔记就是典型：
+        // 它的内容不进 /note/full/page/，所以接口的 folders 里根本没有它。
+        const domNames = await readDomFolders(1500);
+        const known = new Set(fromApi.map(f => normName(f.name)));
+        const extra = domNames.filter(n => !known.has(normName(n)));
+
+        if (extra.length > 0) {
+          extra.forEach(name => fromApi.push({ name, noteCount: '-' }));
+          this.log(`接口未返回、已从页面补上 ${extra.length} 个文件夹：${extra.join('、')}`, 'info');
+        }
+        this.log(`文件夹列表：${fromApi.length} 个，共 ${index.notes.length} 条笔记`, 'info');
         return fromApi;
       }
     } else if (index.reason !== 'disabled') {
       this.log(this.describeCloudFailure(index) + '，改用页面解析', 'warning');
     }
 
-    await this.waitForElement('.sidebar-item-2LDWD, .sidebar-item-3IBBu', 5000);
-
-    const items = document.querySelectorAll('.sidebar-item-2LDWD, .sidebar-item-3IBBu');
-    const folders = [];
-
-    for (const item of items) {
-      const name = this.getFolderName(item);
-
-      // 过滤掉不需要的文件夹
-      if (!excludeFolders.includes(name)) {
-        folders.push({ name, noteCount: '-' });
-      }
-    }
-
-    return folders;
+    const domFolders = await readDomFolders(5000);
+    return domFolders.map(name => ({ name, noteCount: '-' }));
   },
 
   // 从侧边栏文件夹 DOM 节点中提取文件夹名称
@@ -1062,7 +1081,18 @@ const MiNotesExporter = {
     if (!this.processedNotesByFolder[folderName]) this.processedNotesByFolder[folderName] = new Set();
     const processedNotes = this.processedNotesByFolder[folderName];
     
-    await this.waitForElement('.note-item-3E9te, [class*="note-item"]', 5000);
+    try {
+      await this.waitForElement('.note-item-3E9te, [class*="note-item"]', 5000);
+    } catch (e) {
+      // 私密笔记锁着的时候，列表根本不渲染，5 秒后只会抛"等待元素超时"，
+      // 那个报错看不出该怎么处理，这里换成一句能照着做的提示。
+      this.log(
+        `文件夹 "${folderName}"：5 秒内没出现任何笔记列表。` +
+        `如果这是「私密笔记」，请先在页面上输入密码解锁，再点开始导出`,
+        'warning'
+      );
+      return { notes, totalNotesInFolder: 0 };
+    }
     
     const noteCountEl = document.querySelector('.note-count-select-1nzNf');
     let domCount = 0;
