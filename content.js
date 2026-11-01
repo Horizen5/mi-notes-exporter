@@ -1,11 +1,130 @@
 // 内容脚本（运行在 i.mi.com/note/h5 页面内）：负责抓取目录/笔记、转换 Markdown、下载图片与导出文件
+
+// ---------- 通用工具：并发池 ----------
+// 按固定并发度跑一批异步任务，结果按原顺序返回。串行 await 是图片下载慢的主因。
+async function runWithConcurrency(items, limit, worker) {
+  const total = items.length;
+  const results = new Array(total);
+  if (total === 0) return results;
+  const size = Math.max(1, Math.min(parseInt(limit, 10) || 1, total));
+  let cursor = 0;
+  const runners = [];
+  for (let n = 0; n < size; n++) {
+    runners.push((async () => {
+      for (;;) {
+        const i = cursor++;
+        if (i >= total) return;
+        results[i] = await worker(items[i], i);
+      }
+    })());
+  }
+  await Promise.all(runners);
+  return results;
+}
+
+// ---------- 通用工具：ZIP 打包（仅存储不压缩，图片本就是压缩格式） ----------
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC32_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// 极简 ZIP 写入器：只支持"存储"方式和 UTF-8 文件名，够用且没有第三方依赖
+function createZipWriter() {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralRecords = [];
+  let offset = 0;
+
+  const dosTime = d => ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF;
+  const dosDate = d => (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+
+  async function add(name, blob) {
+    const data = new Uint8Array(await blob.arrayBuffer());
+    const nameBytes = encoder.encode(name);
+    const crc = crc32(data);
+    const now = new Date();
+    const time = dosTime(now);
+    const date = dosDate(now);
+
+    const header = new Uint8Array(30 + nameBytes.length);
+    const hv = new DataView(header.buffer);
+    hv.setUint32(0, 0x04034b50, true);   // 本地文件头签名
+    hv.setUint16(4, 20, true);           // 解压所需版本
+    hv.setUint16(6, 0x0800, true);       // bit 11：文件名为 UTF-8
+    hv.setUint16(8, 0, true);            // 压缩方式：0 = 存储
+    hv.setUint16(10, time, true);
+    hv.setUint16(12, date, true);
+    hv.setUint32(14, crc, true);
+    hv.setUint32(18, data.length, true);
+    hv.setUint32(22, data.length, true);
+    hv.setUint16(26, nameBytes.length, true);
+    hv.setUint16(28, 0, true);
+    header.set(nameBytes, 30);
+
+    localParts.push(header, data);
+    centralRecords.push({ nameBytes, crc, size: data.length, offset, time, date });
+    offset += header.length + data.length;
+  }
+
+  function finish() {
+    const cdParts = [];
+    const cdOffset = offset;
+    let cdSize = 0;
+
+    for (const rec of centralRecords) {
+      const h = new Uint8Array(46 + rec.nameBytes.length);
+      const v = new DataView(h.buffer);
+      v.setUint32(0, 0x02014b50, true);  // 中央目录签名
+      v.setUint16(4, 20, true);
+      v.setUint16(6, 20, true);
+      v.setUint16(8, 0x0800, true);
+      v.setUint16(10, 0, true);
+      v.setUint16(12, rec.time, true);
+      v.setUint16(14, rec.date, true);
+      v.setUint32(16, rec.crc, true);
+      v.setUint32(20, rec.size, true);
+      v.setUint32(24, rec.size, true);
+      v.setUint16(28, rec.nameBytes.length, true);
+      v.setUint32(42, rec.offset, true);
+      h.set(rec.nameBytes, 46);
+      cdParts.push(h);
+      cdSize += h.length;
+    }
+
+    const end = new Uint8Array(22);
+    const ev = new DataView(end.buffer);
+    ev.setUint32(0, 0x06054b50, true);   // 目录结束记录
+    ev.setUint16(8, centralRecords.length, true);
+    ev.setUint16(10, centralRecords.length, true);
+    ev.setUint32(12, cdSize, true);
+    ev.setUint32(16, cdOffset, true);
+
+    return new Blob([...localParts, ...cdParts, end], { type: 'application/zip' });
+  }
+
+  return { add, finish, get count() { return centralRecords.length; } };
+}
+
 const MiNotesExporter = {
   isRunning: false,
   isPaused: false,
   isStopped: false,
   allNotes: [],
   downloadedImages: 0,
+  skippedImages: 0,
   failedImages: 0,
+  reusedNotes: 0,
   currentFolderIndex: 0,
   currentNoteIndex: 0,
   folders: [],
@@ -20,9 +139,23 @@ const MiNotesExporter = {
     minDelay: 1000,
     maxDelay: 3000,
     batchSize: 30,
-    batchPause: 15000
+    batchPause: 15000,
+    // 输出根目录（相对浏览器下载目录，留空则直接放下载目录根）
+    outputDir: '',
+    // 图片并发数：串行下载是慢的主因，4 左右既快又不容易触发风控
+    imageConcurrency: 4,
+    // 图片请求之间的最小间隔（毫秒），限制的是发起频率而非串行等待
+    imageThrottleMs: 120,
+    // 断点续传：命中缓存时直接复用上次的提取结果，不再点开笔记、不再下图片
+    resume: true,
+    // 打包方式：files = 逐个文件（可直接进 Obsidian），zip = 每个文件夹打成一个压缩包
+    packMode: 'files'
   },
   batchCount: 0,
+  lastImageSlot: 0,
+  noteCache: {},
+  zipBuffer: {},
+  _cacheTimer: null,
 
   // 初始化：注册来自侧边栏的消息监听
   init() {
@@ -81,6 +214,22 @@ const MiNotesExporter = {
         // 现在使用 Chrome 原生侧边栏，不再通过 content script 注入
         chrome.runtime.sendMessage({ action: 'openSidePanel' });
         sendResponse({ success: true });
+        break;
+
+      case 'clearCache':
+        // 清空断点续传记录，下次从头导出
+        await this.clearNoteCache();
+        this.log('断点记录已清空，下次将重新导出全部笔记。', 'warning');
+        sendResponse({ success: true });
+        break;
+
+      case 'getCacheStats':
+        sendResponse({
+          success: true,
+          stats: Object.fromEntries(
+            Object.entries(this.noteCache || {}).map(([f, b]) => [f, Object.keys(b || {}).length])
+          )
+        });
         break;
     }
   },
@@ -192,15 +341,33 @@ const MiNotesExporter = {
       return { success: false, error: '登录已过期，请重新登录' };
     }
 
-    // 断点续传已移除：每次开始都从头执行
     this.isRunning = true;
     this.isPaused = false;
     this.isStopped = false;
     this.allNotes = [];
     this.downloadedImages = 0;
+    this.skippedImages = 0;
     this.failedImages = 0;
+    this.reusedNotes = 0;
     this.currentFolderIndex = 0;
     this.currentNoteIndex = 0;
+    this.zipBuffer = {};
+    this.lastImageSlot = 0;
+    this.processedNotesByFolder = {};
+
+    // 断点续传：把上次的提取结果读进来，命中就整条跳过
+    await this.loadNoteCache();
+    if (this.config.packMode === 'zip') {
+      this.log('打包模式：为保证压缩包内图片完整，本次忽略断点记录、全部重新抓取', 'info');
+    } else if (this.config.resume) {
+      const buckets = Object.values(this.noteCache);
+      const noteTotal = buckets.reduce((sum, b) => sum + Object.keys(b || {}).length, 0);
+      if (noteTotal > 0) {
+        this.log(`断点记录已就绪：${buckets.length} 个文件夹 / ${noteTotal} 条笔记，本次会跳过这部分`, 'info');
+      }
+    } else {
+      this.log('断点续传已关闭，本次全部重新导出', 'warning');
+    }
 
     this.sendProgress({ status: 'running', message: '开始导出...' });
 
@@ -270,6 +437,7 @@ const MiNotesExporter = {
       }
 
       await this.exportAnyUnexportedFolders();
+      await this.flushNoteCache();
 
       this.isRunning = false;
       this.sendProgress({
@@ -292,11 +460,10 @@ const MiNotesExporter = {
     }
   },
 
-  // 单文件夹导出：生成 Markdown/JSON 并触发浏览器下载
-  exportFolderNow(folderName, notes, isPartial) {
+  // 单文件夹导出：生成 Markdown / JSON / ZIP 并触发下载
+  async exportFolderNow(folderName, notes, isPartial) {
     const suffix = isPartial ? '_未全部导出' : '';
     const folderMarkdown = this.generateFolderMarkdown(folderName, notes, isPartial);
-    this.downloadFolderMarkdown(folderMarkdown, folderName, suffix);
 
     const folderExportData = {
       folder: folderName,
@@ -305,7 +472,13 @@ const MiNotesExporter = {
       notes: notes,
       isPartial: !!isPartial
     };
-    this.downloadJSON(folderExportData, folderName, suffix);
+
+    if (this.config.packMode === 'zip') {
+      await this.downloadFolderZip(folderName, suffix, folderMarkdown, folderExportData);
+    } else {
+      await this.downloadFolderMarkdown(folderMarkdown, folderName, suffix);
+      await this.downloadJSON(folderExportData, folderName, suffix);
+    }
     return this.markFolderExported(folderName, isPartial, notes.length);
   },
 
@@ -640,6 +813,26 @@ const MiNotesExporter = {
 
       if (processedNotes.has(noteId)) return false;
 
+      // 断点续传：命中缓存就直接复用上次结果，不点开、不下载、不等待
+      const cached = this.getCachedNote(folderName, noteId);
+      if (cached) {
+        processedNotes.add(noteId);
+        notes.push(cached);
+        processedInThisBatch.push(noteId);
+        this.reusedNotes++;
+        this.currentNoteIndex = notes.length;
+        this.log(`⏭ [${notes.length}/${totalNotesInFolder}] 上次已导出，跳过: ${cached.title || '无标题'}`, 'info');
+        this.sendProgress({
+          status: 'running',
+          currentNote: cached.title,
+          currentNoteIndex: notes.length,
+          totalNotesInFolder,
+          notesCount: this.allNotes.length + notes.length,
+          imagesCount: this.downloadedImages
+        });
+        return true;
+      }
+
       processedNotes.add(noteId);
 
       try {
@@ -672,7 +865,25 @@ const MiNotesExporter = {
           }
 
           const markdown = this.htmlToMarkdown(contentEl.innerHTML, imageMap);
-          notes.push({ folder: folderName, title, time, text: contentEl.innerText, markdown, images, imageCount: images.length });
+          const note = {
+            folder: folderName,
+            title,
+            time,
+            text: contentEl.innerText,
+            markdown,
+            images,
+            imageCount: images.length
+          };
+          notes.push(note);
+          // 落一份缓存：下次跑的时候这条笔记整条跳过（正文用 markdown，不存纯文本，省空间）
+          this.cacheNote(folderName, noteId, {
+            folder: folderName,
+            title,
+            time,
+            markdown,
+            images,
+            imageCount: images.length
+          });
 
           this.log(`✓ [${notes.length}/${totalNotesInFolder}] 已提取: ${title}`, 'success');
           processedInThisBatch.push(noteId);
@@ -917,67 +1128,93 @@ const MiNotesExporter = {
     return hex.slice(-8).padStart(8, '0');
   },
 
-  // 处理正文中的图片：抓取图片链接并下载为本地文件，返回用于替换的映射表
+  // 处理正文中的图片：并发抓取 -> 全部缓存 -> 统一提交，返回用于替换的映射表
+  // 旧实现是"抓一张睡 1 秒再抓下一张"，一篇 10 张图的笔记要等十几秒，这是慢的主因
   async processImages(contentEl, noteTitle, folderName, noteTime, noteId) {
     const images = [];
-    const imgElements = contentEl.querySelectorAll('img, img.image-view__img');
-    
-    if (imgElements.length === 0) return { images, imageMap: {} };
+    const imageMap = {};
+    const blobs = [];
 
-    this.log(`发现 ${imgElements.length} 张图片，开始下载...`);
-    
-    // 清洗文件夹名
-    const folderPrefix = this.cleanFilename(this.sanitizeFilename(folderName));
-    // 提取日期 YYMMDD
-    const dateStr = this.extractDateFromTime(noteTime);
-    // 提取 NoteID 哈希后缀（8 位）
-    const noteIdSuffix = this.extractNoteIdSuffix(noteId);
-
-    for (let i = 0; i < imgElements.length; i++) {
-      if (this.isStopped) break;
-      
-      const img = imgElements[i];
-      // 使用getAttribute('src')获取原始src，然后构建完整URL
+    // 1. 先收集正文里所有有效图片地址，保留出现顺序
+    const tasks = [];
+    Array.from(contentEl.querySelectorAll('img')).forEach((img, i) => {
       const src = img.getAttribute('src') || img.src || '';
-      
-      if (!src || src.startsWith('data:')) continue;
-      
-      // 构建完整的URL
-      const fullUrl = new URL(src, window.location.origin).href;
+      if (!src || src.startsWith('data:')) return;
+      let fullUrl;
+      try {
+        fullUrl = new URL(src, window.location.origin).href;
+      } catch (e) {
+        return;
+      }
+      tasks.push({ index: i, url: fullUrl, alt: img.alt || `图片${i + 1}` });
+    });
 
-      // 文件名格式：文件夹名_YYMMDD_NoteID哈希8位_序号.jpg
-      const filename = `${folderPrefix}_${dateStr}_${noteIdSuffix}_${i + 1}.jpg`;
+    if (tasks.length === 0) return { images, imageMap, blobs };
 
-      // 使用随机延迟下载图片
-      const imageDelay = this.getRandomDelay(500, 1500);
-      await this.delay(imageDelay);
-      const downloadedName = await this.downloadImage(fullUrl, filename);
+    const folderPrefix = this.cleanFilename(this.sanitizeFilename(folderName));
+    const dateStr = this.extractDateFromTime(noteTime);
+    const noteIdSuffix = this.extractNoteIdSuffix(noteId);
+    const useZip = this.config.packMode === 'zip';
 
-      if (downloadedName) {
-        images.push({
-          index: i,
-          originalSrc: fullUrl,
-          localPath: `./${this.config.imageFolderName}/${downloadedName}`,
-          filename: downloadedName,
-          alt: img.alt || `图片${i + 1}`
-        });
-      } else {
-        images.push({
-          index: i,
-          originalSrc: fullUrl,
-          localPath: fullUrl,
-          filename: null,
-          alt: img.alt || `图片${i + 1}`
-        });
+    // 2. 同一篇笔记里重复出现的同一张图，只抓一次、只存一份
+    const byUrl = new Map();
+    const unique = [];
+    for (const t of tasks) {
+      if (!byUrl.has(t.url)) {
+        const base = `${folderPrefix}_${dateStr}_${noteIdSuffix}_${t.index + 1}.jpg`;
+        byUrl.set(t.url, { url: t.url, baseName: base });
+        unique.push(byUrl.get(t.url));
       }
     }
 
-    const imageMap = {};
-    images.forEach(img => {
-      imageMap[img.originalSrc] = img.localPath;
+    this.log(
+      `发现 ${tasks.length} 张图片${unique.length < tasks.length ? `（去重后 ${unique.length}）` : ''}，` +
+      `并发 ${this.config.imageConcurrency} 开始抓取...`
+    );
+
+    // 3. 并发抓取（受全局节流控制），失败的自动重试一次
+    const fetched = await runWithConcurrency(unique, this.config.imageConcurrency, async (item) => {
+      if (this.isStopped) return null;
+      return this.fetchImage(item.url, item.baseName);
     });
 
-    return { images, imageMap };
+    // 4. 汇总抓到的 Blob
+    const nameByUrl = new Map();
+    unique.forEach((item, i) => {
+      const res = fetched[i];
+      if (res && res.blob) {
+        nameByUrl.set(item.url, res.filename);
+        blobs.push({ name: res.filename, blob: res.blob });
+      }
+    });
+
+    // 5. 落地：逐文件模式并发交给下载器；打包模式先攒着，等整个文件夹处理完再打一个包
+    if (useZip) {
+      if (!this.zipBuffer[folderName]) this.zipBuffer[folderName] = [];
+      this.zipBuffer[folderName].push(...blobs);
+      this.downloadedImages += blobs.length;
+      this.log(`已缓存 ${blobs.length} 张图片，文件夹处理完后统一打包`, 'info');
+    } else {
+      await runWithConcurrency(blobs, 3, async (b) => {
+        await this.saveBlob(b.blob, b.name);
+      });
+    }
+
+    // 6. 按正文顺序回填结果，保证 Markdown 里的图片顺序不乱
+    for (const t of tasks) {
+      const finalName = nameByUrl.get(t.url) || null;
+      const localPath = finalName ? `./${this.config.imageFolderName}/${finalName}` : t.url;
+      images.push({
+        index: t.index,
+        originalSrc: t.url,
+        localPath,
+        filename: finalName,
+        alt: t.alt
+      });
+      imageMap[t.url] = localPath;
+    }
+
+    return { images, imageMap, blobs };
   },
 
   async checkFileInHistory(filename) {
@@ -1000,92 +1237,169 @@ const MiNotesExporter = {
     });
   },
 
-  // 下载单张图片：在 content script 中携带登录态 fetch -> blob -> base64 -> 交给后台保存
-  // 关键约定：本函数无论成功、失败、超时都必须 resolve，绝不能挂起。
-  // 旧实现在 sendMessage 回调里 throw，回调不在 Promise executor 里，Promise 永远不会 settle，
-  // await 会永久等待 —— 这就是"导出过程卡住不动、暂停也没用"的根因。
-  async downloadImage(url, filename) {
-    try {
-      const maxSize = this.config.maxImageSize || 10 * 1024 * 1024;
+  // 抓取单张图片：复用登录态，带节流、体积上限与一次重试
+  // 约定：无论成功失败都返回结果，绝不挂起
+  async fetchImage(url, baseName) {
+    const maxSize = this.config.maxImageSize || 10 * 1024 * 1024;
 
-      this.log(`正在抓取图片: ${filename}`, 'info');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (this.isStopped) return null;
+      try {
+        await this.waitImageSlot();
+        const response = await fetch(url, {
+          method: 'GET',
+          credentials: 'same-origin',
+          mode: 'cors'
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-      // 1. 在前端通过 fetch 抓取图片（利用当前登录会话）
-      const response = await fetch(url, {
-        method: 'GET',
-        credentials: 'same-origin',
-        mode: 'cors'
-      });
+        const blob = await response.blob();
 
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+        if (blob.size > maxSize) {
+          this.skippedImages++;
+          this.log(
+            `⏭ 跳过超大图片: ${baseName} ` +
+            `(${(blob.size / 1024 / 1024).toFixed(1)}MB > ${(maxSize / 1024 / 1024).toFixed(0)}MB)`,
+            'warning'
+          );
+          return null;
+        }
 
-      // 2. 体积预检：超过上限直接跳过，避免 base64 过消息通道时撑爆内存
-      const blob = await response.blob();
-
-      if (blob.size > maxSize) {
+        // 按真实 MIME 决定后缀，不再一律存成 .jpg
+        const filename = baseName.replace(/\.[A-Za-z0-9]+$/, '') + this.getExtensionFromMime(blob.type);
+        return { blob, filename };
+      } catch (err) {
+        if (attempt === 0) {
+          await this.delay(400);
+          continue;
+        }
         this.failedImages++;
-        this.log(
-          `⏭ 跳过超大图片: ${filename} ` +
-          `(${(blob.size / 1024 / 1024).toFixed(1)}MB > ${(maxSize / 1024 / 1024).toFixed(0)}MB)`,
-          'warning'
-        );
+        this.log(`✗ 抓取失败: ${baseName} - ${err.message}`, 'error');
         return null;
       }
-
-      const mimeType = blob.type; // 获取真实的 MIME 类型
-      const extension = this.getExtensionFromMime(mimeType);
-      // 旧写法 filename.replace(/\.png$/, extension) 永远不生效：
-      // filename 生成时固定以 .jpg 结尾，正则匹配不到，导致所有 PNG 都被存成 .jpg
-      const finalFilename = filename.replace(/\.[A-Za-z0-9]+$/, '') + extension;
-
-      // 3. 将 Base64 数据流发送给后台执行下载
-      const base64data = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = reject;
-        reader.readAsDataURL(blob);
-      });
-
-      // 4. 交给后台下载，带 30 秒兜底超时，保证一定会返回
-      return await new Promise((resolve) => {
-        let settled = false;
-        let timer = null;
-
-        const finish = (value) => {
-          if (settled) return;
-          settled = true;
-          if (timer) clearTimeout(timer);
-          resolve(value);
-        };
-
-        timer = setTimeout(() => {
-          this.failedImages++;
-          this.log(`✗ 下载超时(30s): ${filename}`, 'error');
-          finish(null);
-        }, 30000);
-
-        chrome.runtime.sendMessage({
-          action: 'downloadFile',
-          url: base64data,
-          filename: finalFilename,
-          folder: this.config.imageFolderName
-        }, (res) => {
-          if (res && res.success) {
-            this.downloadedImages++;
-            this.log(`✓ 下载成功: ${this.config.imageFolderName}/${finalFilename}`, 'success');
-            finish(finalFilename); // 返回真实的带后缀的文件名
-          } else {
-            this.failedImages++;
-            this.log(`✗ 下载失败: ${filename} - ${res?.error || '后台无响应'}`, 'error');
-            finish(null);
-          }
-        });
-      });
-    } catch (err) {
-      this.log(`✗ 下载失败: ${filename} - ${err.message}`, 'error');
-      this.failedImages++;
-      return null;
     }
+    return null;
+  },
+
+  // 令牌节流：控制"发起请求的频率"，而不是让每张图都白白等一秒
+  async waitImageSlot() {
+    const gap = Math.max(0, parseInt(this.config.imageThrottleMs, 10) || 0);
+    if (!gap) return;
+    const now = Date.now();
+    const target = Math.max(now, (this.lastImageSlot || 0) + gap);
+    this.lastImageSlot = target;
+    const wait = target - now;
+    if (wait > 0) await this.delay(wait);
+  },
+
+  // 把抓到的 Blob 交给后台写盘（走 chrome.downloads，支持子目录）
+  async saveBlob(blob, filename) {
+    const base64data = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+
+    const folder = this.joinPath(this.config.outputDir, this.config.imageFolderName);
+
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+
+      timer = setTimeout(() => {
+        this.failedImages++;
+        this.log(`✗ 保存超时(30s): ${filename}`, 'error');
+        finish(null);
+      }, 30000);
+
+      chrome.runtime.sendMessage({
+        action: 'downloadFile',
+        url: base64data,
+        filename,
+        folder
+      }, (res) => {
+        if (res && res.success) {
+          this.downloadedImages++;
+          this.log(`✓ 已保存: ${this.joinPath(folder, filename)}`, 'success');
+          finish(filename);
+        } else {
+          this.failedImages++;
+          this.log(`✗ 保存失败: ${filename} - ${res?.error || '后台无响应'}`, 'error');
+          finish(null);
+        }
+      });
+    });
+  },
+
+  // 拼接下载路径（相对浏览器下载目录），过滤空段、非法字符与多余斜杠
+  joinPath(...parts) {
+    return parts
+      .filter(p => p !== undefined && p !== null && String(p).trim() !== '')
+      .map(p => String(p).trim()
+        .replace(/[<>:"|?*\x00-\x1f]/g, '')
+        .replace(/^[\/\\]+|[\/\\]+$/g, ''))
+      .filter(Boolean)
+      .join('/');
+  },
+
+  // ---------- 断点续传：按 文件夹 + noteId 缓存已提取的笔记 ----------
+  loadNoteCache() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(['miNotesCache'], (res) => {
+        const cached = res && res.miNotesCache;
+        this.noteCache = (cached && typeof cached === 'object') ? cached : {};
+        resolve(this.noteCache);
+      });
+    });
+  },
+
+  getCachedNote(folderName, noteId) {
+    if (!this.config.resume) return null;
+    // 打包模式下图片只存在于上一次运行的内存里，复用缓存会导致 zip 里缺图，
+    // 所以打包模式一律重新抓取，保证产物完整
+    if (this.config.packMode === 'zip') return null;
+    const bucket = this.noteCache[folderName];
+    return bucket ? bucket[noteId] || null : null;
+  },
+
+  cacheNote(folderName, noteId, payload) {
+    if (!this.noteCache[folderName]) this.noteCache[folderName] = {};
+    this.noteCache[folderName][noteId] = { ...payload, at: new Date().toISOString() };
+    this.scheduleCacheFlush();
+  },
+
+  // 每 2 秒最多落盘一次，避免每条笔记都写一次 storage
+  scheduleCacheFlush() {
+    if (this._cacheTimer) return;
+    this._cacheTimer = setTimeout(() => {
+      this._cacheTimer = null;
+      this.flushNoteCache();
+    }, 2000);
+  },
+
+  flushNoteCache() {
+    if (this._cacheTimer) {
+      clearTimeout(this._cacheTimer);
+      this._cacheTimer = null;
+    }
+    return new Promise((resolve) => {
+      chrome.storage.local.set({ miNotesCache: this.noteCache }, () => resolve());
+    });
+  },
+
+  async clearNoteCache() {
+    this.noteCache = {};
+    return new Promise((resolve) => {
+      chrome.storage.local.remove(['miNotesCache'], (res) => resolve(res));
+    });
   },
 
   // 辅助函数：根据 MIME 类型获取后缀
@@ -1171,11 +1485,8 @@ const MiNotesExporter = {
     });
 
     for (const [folderName, notes] of Object.entries(grouped)) {
-      // 导出 Markdown
       const folderMarkdown = this.generateFolderMarkdown(folderName, notes, isPartial);
-      this.downloadFolderMarkdown(folderMarkdown, folderName, suffix);
-      
-      // 导出 JSON (每个文件夹独立一个)
+
       const folderExportData = {
         folder: folderName,
         total: notes.length,
@@ -1183,14 +1494,95 @@ const MiNotesExporter = {
         notes: notes,
         isPartial
       };
-      this.downloadJSON(folderExportData, folderName, suffix);
+
+      if (this.config.packMode === 'zip') {
+        // 打包模式：md + json + 全部图片合成一个 zip，全程只有一次下载动作
+        await this.downloadFolderZip(folderName, suffix, folderMarkdown, folderExportData);
+      } else {
+        await this.downloadFolderMarkdown(folderMarkdown, folderName, suffix);
+        await this.downloadJSON(folderExportData, folderName, suffix);
+      }
+
       await this.markFolderExported(folderName, isPartial, notes.length);
     }
 
-    const logMessage = isPartial 
+    // 收尾：缓存与待打包数据都要刷干净
+    await this.flushNoteCache();
+    this.zipBuffer = {};
+
+    let logMessage = isPartial
       ? `⏹️ 导出已停止，已保存 ${this.allNotes.length} 条笔记。`
       : `✅ 导出完成！笔记: ${this.allNotes.length}, 图片: ${this.downloadedImages}`;
+    if (this.reusedNotes) logMessage += `，复用上次结果: ${this.reusedNotes} 条`;
+    if (this.failedImages) logMessage += `，失败图片: ${this.failedImages} 张`;
     this.log(logMessage, isPartial ? 'warning' : 'success');
+  },
+
+  // 文件夹打包：md + json + 图片合成单个 zip，只需要一次下载动作
+  async downloadFolderZip(folderName, suffix, markdownText, jsonData) {
+    const sanitized = this.sanitizeFilename(folderName);
+    const images = this.zipBuffer[folderName] || [];
+    const zipName = `${sanitized}${suffix}.zip`;
+    const startedAt = Date.now();
+
+    this.log(`正在打包 "${folderName}"：${images.length} 张图片...`, 'info');
+
+    const zip = createZipWriter();
+    await zip.add(`${sanitized}${suffix}.md`, new Blob([markdownText], { type: 'text/markdown' }));
+    await zip.add(`mi_note_${sanitized}${suffix}.json`, new Blob([JSON.stringify(jsonData, null, 2)], { type: 'application/json' }));
+    for (const img of images) {
+      if (this.isStopped) break;
+      await zip.add(`${this.config.imageFolderName}/${img.name}`, img.blob);
+    }
+
+    const blob = zip.finish();
+    this.zipBuffer[folderName] = [];
+
+    const ok = await this.saveFileBlob(blob, zipName, true);
+    if (ok) {
+      this.log(
+        `✅ 已打包: ${zipName}（${(blob.size / 1048576).toFixed(1)}MB，${zip.count} 个文件，` +
+        `耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s）`,
+        'success'
+      );
+    } else {
+      this.log(`✗ 打包失败: ${zipName}`, 'error');
+    }
+  },
+
+  // 保存任意 Blob 到输出目录。
+  // base64 走消息通道有体积上限，超过 40MB 的包退回页面内 <a download>（会落到下载目录根，浏览器限制）
+  async saveFileBlob(blob, filename, allowFallback = false) {
+    const LIMIT = 40 * 1024 * 1024;
+
+    if (allowFallback && blob.size > LIMIT) {
+      this.log(`文件较大（${(blob.size / 1048576).toFixed(0)}MB），改由浏览器直接保存，会落在下载目录根`, 'warning');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      return true;
+    }
+
+    const base64data = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+
+    return await new Promise((resolve) => {
+      chrome.runtime.sendMessage({
+        action: 'downloadFile',
+        url: base64data,
+        filename,
+        folder: this.config.outputDir || ''
+      }, (res) => resolve(!!(res && res.success)));
+    });
   },
 
   markFolderExported(folderName, isPartial, notesCount) {
@@ -1227,33 +1619,22 @@ const MiNotesExporter = {
     return markdown;
   },
 
-  // 触发下载 Markdown 文件
-  downloadFolderMarkdown(content, folderName, suffix = '') {
+  // 保存 Markdown 到输出目录（必须走后台下载，页面内 a 标签无法写入子目录）
+  async downloadFolderMarkdown(content, folderName, suffix = '') {
     const sanitizedFolderName = this.sanitizeFilename(folderName);
+    const name = `${sanitizedFolderName}${suffix}.md`;
     const blob = new Blob([content], { type: 'text/markdown' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${sanitizedFolderName}${suffix}.md`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const ok = await this.saveFileBlob(blob, name);
+    if (ok) this.log(`✓ 已保存 Markdown: ${this.joinPath(this.config.outputDir, name)}`, 'success');
   },
 
-  // 触发下载 JSON 文件（mi_note_文件夹名.json）
-  downloadJSON(data, folderName, suffix = '') {
+  // 保存 JSON（mi_note_文件夹名.json）
+  async downloadJSON(data, folderName, suffix = '') {
     const sanitizedName = this.sanitizeFilename(folderName);
-    const jsonStr = JSON.stringify(data, null, 2);
-    const blob = new Blob([jsonStr], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `mi_note_${sanitizedName}${suffix}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    const name = `mi_note_${sanitizedName}${suffix}.json`;
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const ok = await this.saveFileBlob(blob, name);
+    if (ok) this.log(`✓ 已保存 JSON: ${this.joinPath(this.config.outputDir, name)}`, 'success');
   },
 
   formatTime(timeString) {

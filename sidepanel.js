@@ -62,6 +62,7 @@ function bindEvents() {
   document.getElementById('btn-stop').onclick = stopExport;
   document.getElementById('btn-save-config').onclick = saveConfig;
   document.getElementById('btn-reset-config').onclick = resetConfig;
+  document.getElementById('btn-clear-cache').onclick = clearResumeCache;
   document.getElementById('clear-logs').onclick = () => {
     document.getElementById('log-container').innerHTML = '';
   };
@@ -213,9 +214,24 @@ function getConfig() {
     maxDelay: parseInt(document.getElementById('max-delay').value) || 3000,
     batchSize: parseInt(document.getElementById('batch-size').value) || 30,
     batchPause: (parseInt(document.getElementById('batch-pause').value) || 15) * 1000,
+    outputDir: (document.getElementById('output-dir').value || '').trim(),
+    imageConcurrency: Math.min(8, Math.max(1, parseInt(document.getElementById('image-concurrency').value) || 4)),
+    imageThrottleMs: Math.max(0, parseInt(document.getElementById('image-throttle').value) || 0),
+    packMode: document.getElementById('pack-mode').value,
+    resume: document.getElementById('resume-export').checked,
     noteLoadDelay: 1500,
     folderLoadDelay: 1000
   };
+}
+
+// 清空断点续传记录
+async function clearResumeCache() {
+  try {
+    await sendMessageToContent({ action: 'clearCache' });
+    addLog('断点记录已清除，下次导出会重新抓取全部笔记。', 'warning');
+  } catch (err) {
+    addLog('清除失败: ' + err.message, 'error');
+  }
 }
 
 // 开始导出：把当前配置发送给 content script 执行
@@ -330,7 +346,12 @@ async function saveConfig() {
     minDelay: config.minDelay,
     maxDelay: config.maxDelay,
     batchSize: config.batchSize,
-    batchPause: config.batchPause / 1000 // 转回秒保存
+    batchPause: config.batchPause / 1000, // 转回秒保存
+    outputDir: config.outputDir,
+    imageConcurrency: config.imageConcurrency,
+    imageThrottleMs: config.imageThrottleMs,
+    packMode: config.packMode,
+    resume: config.resume
   };
 
   chrome.storage.local.set({ 'miNotesSettings': settingsToSave }, () => {
@@ -360,6 +381,11 @@ async function loadSavedSettings() {
         if (s.maxDelay) document.getElementById('max-delay').value = s.maxDelay;
         if (s.batchSize) document.getElementById('batch-size').value = s.batchSize;
         if (s.batchPause) document.getElementById('batch-pause').value = s.batchPause;
+        if (s.outputDir !== undefined) document.getElementById('output-dir').value = s.outputDir;
+        if (s.imageConcurrency) document.getElementById('image-concurrency').value = s.imageConcurrency;
+        if (s.imageThrottleMs !== undefined) document.getElementById('image-throttle').value = s.imageThrottleMs;
+        if (s.packMode) document.getElementById('pack-mode').value = s.packMode;
+        if (s.resume !== undefined) document.getElementById('resume-export').checked = s.resume;
         
         addLog('📥 已加载上次保存的配置。', 'info');
       }
@@ -377,7 +403,12 @@ function resetConfig() {
     minDelay: 1000,
     maxDelay: 3000,
     batchSize: 30,
-    batchPause: 15
+    batchPause: 15,
+    outputDir: '',
+    imageConcurrency: 4,
+    imageThrottleMs: 120,
+    packMode: 'files',
+    resume: true
   };
 
   // 更新 UI
@@ -392,6 +423,11 @@ function resetConfig() {
   document.getElementById('max-delay').value = defaults.maxDelay;
   document.getElementById('batch-size').value = defaults.batchSize;
   document.getElementById('batch-pause').value = defaults.batchPause;
+  document.getElementById('output-dir').value = defaults.outputDir;
+  document.getElementById('image-concurrency').value = defaults.imageConcurrency;
+  document.getElementById('image-throttle').value = defaults.imageThrottleMs;
+  document.getElementById('pack-mode').value = defaults.packMode;
+  document.getElementById('resume-export').checked = defaults.resume;
 
   chrome.storage.local.remove(['miNotesSettings'], () => {
     addLog('🔄 已重置为默认设置。', 'info');

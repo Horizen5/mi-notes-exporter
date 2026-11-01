@@ -95,6 +95,40 @@
         </section>
 
         <section class="sp-card">
+          <h2>输出与性能</h2>
+          <div class="sp-input-field">
+            <label>输出目录（相对下载目录，留空则直接放下载目录）</label>
+            <input type="text" id="output-dir" value="" placeholder="例如 小米笔记/2026">
+          </div>
+          <div class="sp-input-grid">
+            <div class="sp-input-field">
+              <label>图片并发数</label>
+              <input type="number" id="image-concurrency" value="4" min="1" max="8">
+            </div>
+            <div class="sp-input-field">
+              <label>请求间隔(ms)</label>
+              <input type="number" id="image-throttle" value="120" min="0" max="2000">
+            </div>
+          </div>
+          <div class="sp-input-field">
+            <label>打包方式</label>
+            <select id="pack-mode">
+              <option value="files" selected>逐个文件（可直接放进 Obsidian）</option>
+              <option value="zip">每个文件夹打成一个 zip</option>
+            </select>
+          </div>
+          <div class="sp-config-group">
+            <label class="sp-switch">
+              <span>断点续传（跳过已导出的笔记）</span>
+              <input type="checkbox" id="resume-export" checked>
+            </label>
+            <div class="sp-config-actions">
+              <button id="btn-clear-cache" class="sp-btn sp-btn-outline sp-btn-sm">清除断点记录</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="sp-card">
           <h2>反爬虫设置</h2>
           <div class="sp-input-grid">
             <div class="sp-input-field">
