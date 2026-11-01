@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "小米笔记导出工具",
-  "version": "1.11.5",
+  "version": "1.11.6",
   "description": "批量导出小米云服务笔记，支持文件夹选择、图片并发下载、断点续传和打包导出",
   "permissions": [
     "activeTab",
