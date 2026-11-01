@@ -1,0 +1,6 @@
+*.zip
+*.log
+历史更新/
+.DS_Store
+Thumbs.db
+desktop.ini
