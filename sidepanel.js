@@ -63,6 +63,7 @@ function bindEvents() {
   document.getElementById('btn-save-config').onclick = saveConfig;
   document.getElementById('btn-reset-config').onclick = resetConfig;
   document.getElementById('btn-clear-cache').onclick = clearResumeCache;
+  document.getElementById('btn-test-api').onclick = testCloudIndex;
   document.getElementById('clear-logs').onclick = () => {
     document.getElementById('log-container').innerHTML = '';
   };
@@ -219,9 +220,27 @@ function getConfig() {
     imageThrottleMs: Math.max(0, parseInt(document.getElementById('image-throttle').value) || 0),
     packMode: document.getElementById('pack-mode').value,
     resume: document.getElementById('resume-export').checked,
+    useCloudIndex: document.getElementById('cloud-index').checked,
     noteLoadDelay: 1500,
     folderLoadDelay: 1000
   };
+}
+
+// 测试接口通不通：只发一次清单请求，不做导出
+async function testCloudIndex() {
+  const logsTab = document.querySelector('.tab-btn[data-tab="logs"]');
+  if (logsTab) logsTab.click();
+  addLog('正在测试接口...', 'info');
+  try {
+    const res = await sendMessageToContent({ action: 'testCloudIndex' });
+    if (res?.success) {
+      addLog(`✅ 接口可用：${res.folders} 个文件夹 / ${res.notes} 条笔记（翻页 ${res.pages} 次）`, 'success');
+    } else {
+      addLog('❌ 接口不可用：' + (res?.error || '未知原因'), 'error');
+    }
+  } catch (err) {
+    addLog('❌ 测试失败：' + err.message, 'error');
+  }
 }
 
 // 清空断点续传记录
@@ -351,7 +370,8 @@ async function saveConfig() {
     imageConcurrency: config.imageConcurrency,
     imageThrottleMs: config.imageThrottleMs,
     packMode: config.packMode,
-    resume: config.resume
+    resume: config.resume,
+    useCloudIndex: config.useCloudIndex
   };
 
   chrome.storage.local.set({ 'miNotesSettings': settingsToSave }, () => {
@@ -386,6 +406,7 @@ async function loadSavedSettings() {
         if (s.imageThrottleMs !== undefined) document.getElementById('image-throttle').value = s.imageThrottleMs;
         if (s.packMode) document.getElementById('pack-mode').value = s.packMode;
         if (s.resume !== undefined) document.getElementById('resume-export').checked = s.resume;
+        if (s.useCloudIndex !== undefined) document.getElementById('cloud-index').checked = s.useCloudIndex;
         
         addLog('📥 已加载上次保存的配置。', 'info');
       }
@@ -408,7 +429,8 @@ function resetConfig() {
     imageConcurrency: 4,
     imageThrottleMs: 120,
     packMode: 'files',
-    resume: true
+    resume: true,
+    useCloudIndex: true
   };
 
   // 更新 UI
@@ -428,6 +450,7 @@ function resetConfig() {
   document.getElementById('image-throttle').value = defaults.imageThrottleMs;
   document.getElementById('pack-mode').value = defaults.packMode;
   document.getElementById('resume-export').checked = defaults.resume;
+  document.getElementById('cloud-index').checked = defaults.useCloudIndex;
 
   chrome.storage.local.remove(['miNotesSettings'], () => {
     addLog('🔄 已重置为默认设置。', 'info');

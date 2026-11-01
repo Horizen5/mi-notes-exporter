@@ -149,13 +149,22 @@ const MiNotesExporter = {
     // 断点续传：命中缓存时直接复用上次的提取结果，不再点开笔记、不再下图片
     resume: true,
     // 打包方式：files = 逐个文件（可直接进 Obsidian），zip = 每个文件夹打成一个压缩包
-    packMode: 'files'
+    packMode: 'files',
+    // 云端清单：用接口拿文件夹与笔记的权威元数据（条数、修改时间）。
+    // 只读元数据，正文仍然走页面 DOM，所以转换质量不变。接口不可用时自动退回纯 DOM 模式。
+    useCloudIndex: true
   },
   batchCount: 0,
   lastImageSlot: 0,
   noteCache: {},
   zipBuffer: {},
   _cacheTimer: null,
+  // 接口清单缓存（5 分钟内复用，避免重复翻页）
+  cloudIndex: null,
+  // 上次各文件夹的导出时间，用于判断"云端有更新但被断点续传跳过"
+  exportedFoldersMap: {},
+  // 本次强制重新抓取的文件夹（检测到云端有更新时设置）
+  _forceRefreshFolder: null,
 
   // 初始化：注册来自侧边栏的消息监听
   init() {
@@ -231,28 +240,58 @@ const MiNotesExporter = {
           )
         });
         break;
+
+      case 'testCloudIndex': {
+        // 侧边栏"测试接口"用：只看接口通不通，不做任何导出
+        const idx = await this.fetchCloudIndex();
+        if (idx.ok) {
+          this.cloudIndex = idx;
+          this.log(`接口正常：${idx.pages} 次翻页，${idx.folders.length} 个文件夹 / ${idx.notes.length} 条笔记`, 'success');
+          idx.folders.forEach(f => this.log(`   · ${f.name}：${f.count} 条`, 'info'));
+          sendResponse({ success: true, folders: idx.folders.length, notes: idx.notes.length, pages: idx.pages });
+        } else {
+          const why = this.describeCloudFailure(idx);
+          this.log('接口不可用：' + why, 'error');
+          sendResponse({ success: false, error: why });
+        }
+        break;
+      }
     }
   },
 
   // 获取左侧文件夹列表（用于侧边栏展示与选择）
+  // 优先走接口：自带真实条数，且不受侧边栏类名改版影响；接口不可用再退回读 DOM
   async getFolders() {
+    const excludeFolders = ['已完成', '未完成', '最近删除', '我的文件夹', '全部笔记', '私密笔记'];
+
+    const index = await this.ensureCloudIndex();
+    if (index.ok) {
+      const fromApi = index.folders
+        .filter(f => f.name && !excludeFolders.includes(f.name))
+        .map(f => ({ name: f.name, noteCount: String(f.count) }));
+
+      if (fromApi.length > 0) {
+        this.log(`文件夹列表来自接口：${fromApi.length} 个，共 ${index.notes.length} 条笔记`, 'info');
+        return fromApi;
+      }
+    } else if (index.reason !== 'disabled') {
+      this.log(this.describeCloudFailure(index) + '，改用页面解析', 'warning');
+    }
+
     await this.waitForElement('.sidebar-item-2LDWD, .sidebar-item-3IBBu', 5000);
-    
+
     const items = document.querySelectorAll('.sidebar-item-2LDWD, .sidebar-item-3IBBu');
     const folders = [];
-    
-    // 不需要的文件夹列表
-    const excludeFolders = ['已完成', '未完成', '最近删除', '我的文件夹'];
-    
+
     for (const item of items) {
       const name = this.getFolderName(item);
-      
+
       // 过滤掉不需要的文件夹
       if (!excludeFolders.includes(name)) {
         folders.push({ name, noteCount: '-' });
       }
     }
-    
+
     return folders;
   },
 
@@ -268,6 +307,204 @@ const MiNotesExporter = {
 
     const name = textEl ? (textEl.innerText || '').trim() : '';
     return name || '未命名文件夹';
+  },
+
+  // ---------- 云端清单：接口只读元数据 ----------
+  // 目的：拿到权威的「文件夹有哪些、每个文件夹多少条、每条何时改过」。
+  // 正文仍然从页面 DOM 取，所以 Markdown 转换质量与原来一致；这里只补上原来靠猜的三件事。
+  // 任何一步失败都返回 { ok:false }，调用方退回原来的 DOM 解析，不影响已能用的流程。
+
+  async fetchCloudIndex(options = {}) {
+    const limit = 200;
+    const maxPages = 200;                    // 4 万条上限，同时防止 syncTag 不前进导致死循环
+    const timeoutMs = options.timeout || 15000;
+    const notes = [];
+    const folderNames = new Map();           // folderId -> 名称
+    let syncTag = '';
+    let pages = 0;
+
+    const fetchPage = async (tag) => {
+      const url = 'https://i.mi.com/note/full/page/?ts=' + Date.now() +
+        '&limit=' + limit + '&syncTag=' + encodeURIComponent(tag || '');
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+      try {
+        const resp = await fetch(url, {
+          method: 'GET',
+          // 同源请求，登录态由浏览器自动附带，不需要手工填 cookie
+          credentials: 'include',
+          headers: { Accept: 'application/json, text/plain, */*' },
+          signal: controller ? controller.signal : undefined
+        });
+        if (resp.status === 401 || resp.status === 403) {
+          return { ok: false, reason: 'auth', status: resp.status };
+        }
+        if (!resp.ok) {
+          return { ok: false, reason: 'http', status: resp.status };
+        }
+        const body = await resp.json();
+        // 小米的响应有两种外壳：{data:{...}} 和 {R,S,D}，都兼容一下
+        const payload = body && (body.data || body.D);
+        if (!payload || (!payload.entries && !payload.list)) {
+          return { ok: false, reason: 'shape' };
+        }
+        return { ok: true, payload };
+      } catch (err) {
+        const aborted = err && err.name === 'AbortError';
+        return { ok: false, reason: aborted ? 'timeout' : 'network', message: err && err.message };
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    while (pages < maxPages) {
+      const page = await fetchPage(syncTag);
+      if (!page.ok) {
+        // 第一页就失败说明这条路整体走不通，直接告诉调用方降级
+        if (pages === 0) return page;
+        break;
+      }
+
+      const p = page.payload;
+      (p.folders || []).forEach(f => {
+        if (f == null || f.id == null) return;
+        const name = String(f.subject || '').trim();
+        if (name) folderNames.set(String(f.id), name);
+      });
+
+      const list = p.entries || p.list || [];
+      list.forEach(e => {
+        if (!e || e.id == null) return;
+        notes.push({
+          id: String(e.id),
+          folderId: String(e.folderId == null ? 0 : e.folderId),
+          modifyDate: Number(e.modifyDate || 0),
+          createDate: Number(e.createDate || 0),
+          snippet: String(e.snippet || '')
+        });
+      });
+
+      pages++;
+      if (p.lastPage) break;
+      const nextTag = p.syncTag;
+      if (!nextTag || nextTag === syncTag) break;
+      syncTag = nextTag;
+    }
+
+    if (notes.length === 0) {
+      return { ok: false, reason: 'empty' };
+    }
+
+    // 按文件夹归并，顺便把没有名字的 folderId 标出来（大概率是接口新增的虚拟分类）
+    const countByFolder = {};
+    const byFolder = {};
+    const unknownFolderIds = new Set();
+
+    notes.forEach(n => {
+      countByFolder[n.folderId] = (countByFolder[n.folderId] || 0) + 1;
+      const name = folderNames.get(n.folderId);
+      if (!name) {
+        unknownFolderIds.add(n.folderId);
+        return;
+      }
+      if (!byFolder[name]) byFolder[name] = [];
+      byFolder[name].push(n);
+    });
+
+    const folders = Array.from(folderNames, ([id, name]) => ({
+      id,
+      name,
+      count: countByFolder[id] || 0
+    }));
+
+    return {
+      ok: true,
+      fetchedAt: Date.now(),
+      pages,
+      notes,
+      byFolder,
+      folders,
+      unknownFolderIds: Array.from(unknownFolderIds)
+    };
+  },
+
+  // 取清单：默认 5 分钟内复用，force=true 强制重取
+  async ensureCloudIndex(force = false) {
+    if (!this.config.useCloudIndex) {
+      return { ok: false, reason: 'disabled' };
+    }
+    if (!force && this.cloudIndex && Date.now() - this.cloudIndex.fetchedAt < 5 * 60 * 1000) {
+      return this.cloudIndex;
+    }
+    const res = await this.fetchCloudIndex();
+    if (res.ok) this.cloudIndex = res;
+    return res;
+  },
+
+  // 把接口失败原因翻译成人话，日志里直接能看懂
+  describeCloudFailure(res) {
+    const map = {
+      disabled: '云端清单已在设置里关闭',
+      auth: '接口返回未登录，按 DOM 模式继续',
+      http: `接口返回异常状态 ${res.status || ''}`.trim(),
+      timeout: '接口请求超时',
+      network: '接口请求失败',
+      shape: '接口返回结构不认识（可能改版了）',
+      empty: '接口返回空清单'
+    };
+    return map[res.reason] || ('接口不可用: ' + (res.message || res.reason || '未知原因'));
+  },
+
+  // 某个文件夹自上次导出后有没有云端更新
+  // 依据：接口给的 modifyDate 与上次导出时间比较。用来解决"改了内容但断点续传直接跳过"的问题。
+  getFolderChangeInfo(folderName) {
+    const cloud = this.cloudIndex && this.cloudIndex.byFolder ? this.cloudIndex.byFolder[folderName] : null;
+    if (!cloud || cloud.length === 0) return null;
+
+    const last = this.exportedFoldersMap ? this.exportedFoldersMap[folderName] : null;
+    const lastTs = last && last.exportTime ? Date.parse(last.exportTime) : 0;
+    const updated = lastTs > 0 ? cloud.filter(n => (n.modifyDate || 0) > lastTs).length : 0;
+
+    return {
+      cloudTotal: cloud.length,
+      lastExport: lastTs,
+      updated,
+      lastCachedCount: last && typeof last.notesCount === 'number' ? last.notesCount : null
+    };
+  },
+
+  // 导出后核对：用接口的正文摘要去对本地导出的笔记，找出"云端有、本地没抓到"的
+  // 只是提示，不阻断流程——摘要可能带富文本标签，比对本身存在误报
+  verifyFolderAgainstCloud(folderName, notes) {
+    const cloud = this.cloudIndex && this.cloudIndex.byFolder ? this.cloudIndex.byFolder[folderName] : null;
+    if (!cloud || cloud.length === 0) return null;
+
+    const normalize = (s) => String(s || '')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/\s+/g, '')
+      .toLowerCase();
+
+    const localHeads = (notes || []).map(n => normalize((n.markdown || n.text || '').slice(0, 300)));
+
+    const missing = [];
+    cloud.forEach(c => {
+      const head = normalize(c.snippet).slice(0, 12);
+      if (head.length < 4) return;                 // 摘要太短，没法定
+      const hit = localHeads.some(h => h.includes(head));
+      if (!hit) missing.push({
+        id: c.id,
+        modifyDate: c.modifyDate,
+        // 这里保留原文（只去标签），日志里读起来是人话
+        head: String(c.snippet || '').replace(/<[^>]+>/g, '').trim().slice(0, 30)
+      });
+    });
+
+    return {
+      cloudTotal: cloud.length,
+      localTotal: (notes || []).length,
+      missing
+    };
   },
 
   // 校验登录状态：导出前/批量过程中用于判断是否掉线
@@ -357,6 +594,9 @@ const MiNotesExporter = {
 
     // 断点续传：把上次的提取结果读进来，命中就整条跳过
     await this.loadNoteCache();
+    // 上次各文件夹的导出时间：用来判断"云端改过、但被断点续传跳过了"
+    await this.loadExportedFolders();
+
     if (this.config.packMode === 'zip') {
       this.log('打包模式：为保证压缩包内图片完整，本次忽略断点记录、全部重新抓取', 'info');
     } else if (this.config.resume) {
@@ -369,19 +609,49 @@ const MiNotesExporter = {
       this.log('断点续传已关闭，本次全部重新导出', 'warning');
     }
 
+    // 云端清单：拿到权威条数与修改时间。失败就整体降级成原来的 DOM 模式，不阻断导出。
+    if (this.config.useCloudIndex) {
+      this.log('正在获取云端笔记清单...', 'info');
+      const index = await this.ensureCloudIndex(true);
+      if (index.ok) {
+        this.log(`云端清单已就绪：${index.folders.length} 个文件夹 / ${index.notes.length} 条笔记`, 'success');
+      } else {
+        this.log(this.describeCloudFailure(index) + '，本次按页面解析的条数走', 'warning');
+      }
+    }
+
     this.sendProgress({ status: 'running', message: '开始导出...' });
 
     try {
       this.exportedFoldersInRun = new Set();
-      const items = document.querySelectorAll('.sidebar-item-2LDWD, .sidebar-item-3IBBu');
-      this.folders = Array.from(items).filter(item => {
-        const name = this.getFolderName(item);
-        return this.config.selectedFolders.includes(name);
+
+      // 按用户选择的名字去侧边栏里定位元素。
+      // 接口返回的文件夹名和 DOM 里显示的可能差一个空格、半个括号，所以做两级兜底匹配，
+      // 匹配不到再报警——这一步失败会表现为"未选择任何文件夹"，必须显式提示。
+      const items = Array.from(document.querySelectorAll('.sidebar-item-2LDWD, .sidebar-item-3IBBu'));
+      const normName = (s) => String(s || '')
+        .replace(/[\s\u00a0]+/g, '')
+        .replace(/[（(][^）)]*[）)]/g, '')
+        .toLowerCase();
+      const pool = items.map(el => ({ el, name: this.getFolderName(el), norm: normName(this.getFolderName(el)) }));
+
+      this.folders = [];
+      this.config.selectedFolders.forEach(want => {
+        const wantNorm = normName(want);
+        let hit = pool.find(r => r.name === want);
+        if (!hit) hit = pool.find(r => r.norm === wantNorm);
+        if (!hit) hit = pool.find(r => r.norm && wantNorm && (r.norm.includes(wantNorm) || wantNorm.includes(r.norm)));
+
+        if (hit) {
+          this.folders.push({ element: hit.el, name: want });
+        } else {
+          this.log(`⚠ 侧边栏里找不到文件夹 "${want}"，已跳过`, 'warning');
+        }
       });
 
       if (this.folders.length === 0) {
         this.isRunning = false;
-        return { success: false, error: '未选择任何文件夹' };
+        return { success: false, error: '未选择任何文件夹（侧边栏里没找到对应条目，请先点一次"刷新文件夹列表"）' };
       }
 
       this.sendProgress({
@@ -401,7 +671,7 @@ const MiNotesExporter = {
 
         this.currentFolderIndex = i;
         const folder = this.folders[i];
-        const folderName = this.getFolderName(folder);
+        const folderName = folder.name;
 
         this.sendProgress({
           status: 'running',
@@ -411,14 +681,50 @@ const MiNotesExporter = {
           message: `正在处理文件夹: ${folderName}`
         });
 
+        // 云端改动检测：这个文件夹上次导出之后如果又改过，本次强制重抓，
+        // 否则断点续传会把改过的笔记当成"已导出"直接跳掉，用户永远拿不到新内容
+        this._forceRefreshFolder = null;
+        const change = this.getFolderChangeInfo(folderName);
+        if (change && change.updated > 0 && this.config.resume) {
+          this._forceRefreshFolder = folderName;
+          this.log(
+            `文件夹 "${folderName}" 距上次导出后云端有 ${change.updated} 条修改，本次强制重新抓取该文件夹`,
+            'warning'
+          );
+        } else if (change && change.lastCachedCount != null && change.lastCachedCount > change.cloudTotal) {
+          this.log(
+            `文件夹 "${folderName}"：云端现有 ${change.cloudTotal} 条，上次导出记录是 ${change.lastCachedCount} 条，可能有笔记被删除`,
+            'warning'
+          );
+        }
+
         try {
-          folder.click();
+          folder.element.click();
           await this.delay(this.config.folderLoadDelay);
           
           const result = await this.extractNotesFromFolder(folderName);
           const notes = result.notes || [];
           const totalNotesInFolder = result.totalNotesInFolder || 0;
           this.allNotes.push(...notes);
+
+          // 导出后用云端摘要核对一遍，把疑似漏掉的笔记列出来（只提示，不阻断）
+          const check = this.verifyFolderAgainstCloud(folderName, notes);
+          if (check) {
+            if (check.missing.length === 0) {
+              this.log(`核对通过：云端 ${check.cloudTotal} 条，本地 ${check.localTotal} 条`, 'success');
+            } else {
+              this.log(
+                `⚠ 核对不完整：云端 ${check.cloudTotal} 条，本地 ${check.localTotal} 条，${check.missing.length} 条疑似漏抓`,
+                'warning'
+              );
+              check.missing.slice(0, 5).forEach(m => {
+                this.log(`   · 疑似遗漏：${m.head || m.id}${m.head ? '...' : ''}`, 'warning');
+              });
+              if (check.missing.length > 5) {
+                this.log(`   · 其余 ${check.missing.length - 5} 条未逐一列出`, 'warning');
+              }
+            }
+          }
 
           if (notes.length > 0) {
             const isPartialFolder = this.isStopped || (totalNotesInFolder > 0 && notes.length < totalNotesInFolder);
@@ -435,6 +741,8 @@ const MiNotesExporter = {
           this.log(`处理文件夹 "${folderName}" 时出错: ${err.message}`, 'error');
         }
       }
+
+      this._forceRefreshFolder = null;
 
       await this.exportAnyUnexportedFolders();
       await this.flushNoteCache();
@@ -757,17 +1065,29 @@ const MiNotesExporter = {
     await this.waitForElement('.note-item-3E9te, [class*="note-item"]', 5000);
     
     const noteCountEl = document.querySelector('.note-count-select-1nzNf');
-    let totalNotesInFolder = 0;
+    let domCount = 0;
     if (noteCountEl) {
       const match = noteCountEl.innerText.match(/共\s*(\d+)\s*条笔记/);
-      if (match) totalNotesInFolder = parseInt(match[1]);
+      if (match) domCount = parseInt(match[1]);
     }
     
-    if (totalNotesInFolder === 0) {
-      totalNotesInFolder = document.querySelectorAll('.note-item-3E9te, [class*="note-item"]').length;
+    if (domCount === 0) {
+      domCount = document.querySelectorAll('.note-item-3E9te, [class*="note-item"]').length;
     }
 
-    this.log(`文件夹 "${folderName}" 预计有 ${totalNotesInFolder} 条笔记`);
+    // 分母优先用接口给的真实条数：页面那句"共 N 条笔记"改版就没了，接口的数是准的。
+    // 取两者较大的那个，避免接口少算（比如私密笔记不返回）导致循环提前退出、静默漏单。
+    const cloudNotes = this.cloudIndex && this.cloudIndex.byFolder
+      ? this.cloudIndex.byFolder[folderName]
+      : null;
+    const cloudCount = cloudNotes ? cloudNotes.length : 0;
+    let totalNotesInFolder = Math.max(domCount, cloudCount);
+
+    if (cloudCount > 0) {
+      this.log(`文件夹 "${folderName}"：云端 ${cloudCount} 条 / 页面显示 ${domCount} 条，按 ${totalNotesInFolder} 条处理`, 'info');
+    } else {
+      this.log(`文件夹 "${folderName}" 预计有 ${totalNotesInFolder} 条笔记`);
+    }
 
     const firstItem = document.querySelector('.note-item-3E9te, [class*="note-item"]');
     const scrollContainer = firstItem ? 
@@ -1361,11 +1681,24 @@ const MiNotesExporter = {
     });
   },
 
+  // 上次各文件夹的导出时间与条数，用于云端改动检测
+  loadExportedFolders() {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(['miNotesExportedFolders'], (res) => {
+        const map = res && res.miNotesExportedFolders;
+        this.exportedFoldersMap = (map && typeof map === 'object') ? map : {};
+        resolve(this.exportedFoldersMap);
+      });
+    });
+  },
+
   getCachedNote(folderName, noteId) {
     if (!this.config.resume) return null;
     // 打包模式下图片只存在于上一次运行的内存里，复用缓存会导致 zip 里缺图，
     // 所以打包模式一律重新抓取，保证产物完整
     if (this.config.packMode === 'zip') return null;
+    // 检测到云端有新修改时，整个文件夹强制重抓，避免"改了内容却被缓存跳过"
+    if (this._forceRefreshFolder && this._forceRefreshFolder === folderName) return null;
     const bucket = this.noteCache[folderName];
     return bucket ? bucket[noteId] || null : null;
   },
@@ -1596,6 +1929,8 @@ const MiNotesExporter = {
           isPartial: !!isPartial,
           notesCount: notesCount || 0
         };
+        // 同步回内存，避免同一次运行里再判断时用的是旧快照
+        this.exportedFoldersMap = map;
         chrome.storage.local.set({ 'miNotesExportedFolders': map }, () => resolve());
       });
     });
